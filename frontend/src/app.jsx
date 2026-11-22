@@ -140,7 +140,7 @@ function App() {
     <div className="app">
       <header className="topbar">
         <div className="brand">
-          <h1>K_two_lot_60</h1>
+          <h1>Dillybar's Value Area Trade Bot</h1>
           <p>MNQ value-area strategy · TopstepX gateway</p>
         </div>
         <div className={`pill ${connected ? 'online' : ''}`}>
