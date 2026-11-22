@@ -2,18 +2,20 @@
 
 import asyncio
 import json
-import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, asdict
 from datetime import datetime, time as clock, timezone
 from enum import Enum
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Union
 
 import httpx
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from zoneinfo import ZoneInfo
+
+from backtest_va import from_100ns, rth_profile_for_session
 
 
 # ============================================================================
@@ -39,11 +41,15 @@ RUNNER_TICKS = 0          # Runner goes to opposite VA edge
 MIN_POC_DIST = 120        # 30 points
 ENTRY_HOUR, ENTRY_MINUTE = 10, 15
 ENTRY_END = clock(15, 0)
+RTH_START = clock(9, 30)
 RTH_END = clock(16, 0)
 
 TICK_CENTS = 50
 COMMISSION_CENTS = 50
 STOP_SLIP_TICKS = 1
+
+SESSIONS_DIR = Path("output/sessions")
+REPLAY_SPEEDS = {"10": 10.0, "50": 50.0, "max": None}
 
 
 # ============================================================================
@@ -156,8 +162,12 @@ class KTwoLot60Engine:
                 if self.state == State.FLAT:
                     return actions  # Position closed
         
-        # Check for entry
-        if self.state == State.FLAT and self.entry_window_open and not self.position:
+        # Check for entry (must already be armed from a POC cross)
+        if (
+            self.state in (State.ARMED_SHORT, State.ARMED_LONG)
+            and self.entry_window_open
+            and not self.position
+        ):
             entry_action = self._check_entry(price, ts)
             if entry_action:
                 actions.append(entry_action)
@@ -183,45 +193,40 @@ class KTwoLot60Engine:
         """Update POC crossing armed state."""
         if self.profile.poc == 0:
             return
-            
-        # Check for cross through POC
-        if self.origin == -1 and price > self.profile.poc:
-            # Crossed up through POC - arm short
-            self.state = State.ARMED_SHORT
-        elif self.origin == 1 and price < self.profile.poc:
-            # Crossed down through POC - arm long
-            self.state = State.ARMED_LONG
-        
-        # Update origin
+
+        # Never overwrite an open position's state with arming flags
+        if self.state != State.IN_POSITION:
+            if self.origin == -1 and price > self.profile.poc:
+                self.state = State.ARMED_SHORT
+            elif self.origin == 1 and price < self.profile.poc:
+                self.state = State.ARMED_LONG
+
         if price > self.profile.poc:
             self.origin = 1
         elif price < self.profile.poc:
             self.origin = -1
         else:
             self.origin = 0
-    
+
     def _check_entry(self, price: int, ts: datetime) -> Optional[dict]:
         """Check if entry conditions met."""
         if self.profile.vah == 0 or self.profile.val == 0:
             return None
-        
-        # Check POC distance requirement
+
         if self.state == State.ARMED_SHORT:
             trigger = self.profile.vah
             # Must be below VAH and cross up through it
             if self.prev_price and self.prev_price < trigger and price >= trigger:
-                # Check POC distance
                 if abs(self.profile.poc - trigger) >= MIN_POC_DIST:
                     return self._enter_position(-1, price, ts, trigger)
-                    
+
         elif self.state == State.ARMED_LONG:
             trigger = self.profile.val
             # Must be above VAL and cross down through it
             if self.prev_price and self.prev_price > trigger and price <= trigger:
-                # Check POC distance
                 if abs(self.profile.poc - trigger) >= MIN_POC_DIST:
                     return self._enter_position(1, price, ts, trigger)
-        
+
         return None
     
     def _enter_position(self, direction: int, price: int, ts: datetime, 
@@ -636,35 +641,101 @@ class TopstepClient:
 # Connection Manager
 # ============================================================================
 
+def list_sessions(sessions_dir: Path = SESSIONS_DIR) -> list[dict]:
+    """Load session metadata from manifest.json."""
+    manifest_path = sessions_dir / "manifest.json"
+    if not manifest_path.exists():
+        return []
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    sessions = []
+    for row in manifest.get("sessions", []):
+        sessions.append({
+            "date": row.get("date_eastern"),
+            "file": row.get("file"),
+            "records": row.get("records"),
+            "session_class": row.get("session_class"),
+            "include_in_primary": row.get("include_in_primary", False),
+            "low": row.get("low"),
+            "high": row.get("high"),
+            "note": row.get("note") or "",
+        })
+    sessions.sort(key=lambda s: s["date"] or "", reverse=True)
+    return sessions
+
+
+def resolve_session_file(session_date: str, sessions_dir: Path = SESSIONS_DIR) -> Path:
+    """Resolve a session date to its .npy path."""
+    for row in list_sessions(sessions_dir):
+        if row["date"] == session_date:
+            path = sessions_dir / row["file"]
+            if not path.exists():
+                raise FileNotFoundError(f"Session file missing: {path}")
+            return path
+    # Fall back to conventional filename
+    path = sessions_dir / f"{session_date}.npy"
+    if path.exists():
+        return path
+    raise FileNotFoundError(f"No session found for {session_date}")
+
+
 class ConnectionManager:
     """Manages WebSocket connections and strategy execution."""
-    
+
     def __init__(self):
         self.active_connections: list[WebSocket] = []
         self.engine: Optional[KTwoLot60Engine] = None
         self.topstep: Optional[TopstepClient] = None
         self.running = False
         self.test_mode = True
-        
+        self.mode = "test"
+        self.replay_task: Optional[asyncio.Task] = None
+
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
-        
+
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
-        
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
     async def broadcast(self, message: dict):
+        dead = []
         for connection in self.active_connections:
-            await connection.send_json(message)
-    
-    async def start_strategy(self, test_mode: bool = True):
-        """Start the strategy engine."""
+            try:
+                await connection.send_json(message)
+            except Exception:
+                dead.append(connection)
+        for connection in dead:
+            self.disconnect(connection)
+
+    async def start_strategy(
+        self,
+        mode: str = "test",
+        session_date: Optional[str] = None,
+        speed: Union[str, float] = 50,
+        test_mode: Optional[bool] = None,
+    ):
+        """Start the strategy engine in test, replay, or live mode."""
+        # Backward compatible with older clients that only sent test_mode
+        if test_mode is not None and mode == "test":
+            mode = "test" if test_mode else "live"
+
+        if mode not in ("test", "replay", "live"):
+            raise ValueError(f"Unknown mode: {mode}")
+        if mode == "replay" and not session_date:
+            raise ValueError("session_date is required for replay mode")
+
+        self.stop()
+        await asyncio.sleep(0)  # let prior loop observe running=False
+
         self.engine = KTwoLot60Engine()
         self.running = True
-        self.test_mode = test_mode
+        self.mode = mode
+        self.test_mode = mode != "live"
 
-        if not test_mode:
+        if mode == "live":
             if not TOPSTEP_USERNAME or not TOPSTEP_API_KEY:
+                self.running = False
                 raise RuntimeError(
                     "Live mode requires TOPSTEP_USERNAME and TOPSTEP_API_KEY in .env"
                 )
@@ -679,7 +750,9 @@ class ConnectionManager:
                 self.running = False
                 raise RuntimeError("TopstepX authentication failed")
 
-        asyncio.create_task(self._market_data_loop(test_mode))
+        self.replay_task = asyncio.create_task(
+            self._market_data_loop(mode, session_date=session_date, speed=speed)
+        )
 
     async def ensure_topstep(self) -> TopstepClient:
         """Authenticate a Topstep client even when the strategy is not running live."""
@@ -727,9 +800,8 @@ class ConnectionManager:
                 "status": self.engine.get_status(),
             })
 
-        # Always attempt broker flatten when credentials are configured —
-        # emergency close should work even if the strategy is in test mode.
-        if TOPSTEP_USERNAME and TOPSTEP_API_KEY:
+        # Broker flatten only in live mode (replay/test stay local-engine only).
+        if self.mode == "live" and TOPSTEP_USERNAME and TOPSTEP_API_KEY:
             try:
                 client = await self.ensure_topstep()
                 result["broker"] = await client.close_all_positions()
@@ -751,12 +823,26 @@ class ConnectionManager:
         result["success"] = broker_ok and engine_ok
         return result
 
-    async def _market_data_loop(self, test_mode: bool):
+    async def _market_data_loop(
+        self,
+        mode: str,
+        session_date: Optional[str] = None,
+        speed: Union[str, float] = 50,
+    ):
         """Main loop for processing market data."""
-        if test_mode:
-            await self._simulated_data_loop()
-        else:
-            await self._live_data_loop()
+        try:
+            if mode == "test":
+                await self._simulated_data_loop()
+            elif mode == "replay":
+                await self._replay_data_loop(session_date, speed)
+            else:
+                await self._live_data_loop()
+        except Exception as e:
+            await self.broadcast({
+                "type": "status",
+                "message": f"Data loop failed: {e}",
+            })
+            self.running = False
 
     async def _simulated_data_loop(self):
         """Simulated market data for testing."""
@@ -775,7 +861,7 @@ class ConnectionManager:
             price += random.randint(-2, 2)
 
             ts = datetime.now(EASTERN)
-            is_rth = clock(9, 30) <= ts.time() < clock(16, 0)
+            is_rth = RTH_START <= ts.time() < RTH_END
 
             actions = self.engine.on_tick(price, ts, is_rth)
 
@@ -793,6 +879,137 @@ class ConnectionManager:
             })
 
             await asyncio.sleep(0.1)
+
+    async def _replay_data_loop(
+        self,
+        session_date: str,
+        speed: Union[str, float] = 50,
+    ):
+        """Replay a historical RTH session from output/sessions/*.npy."""
+        path = resolve_session_file(session_date)
+        data = np.load(path)
+
+        prices = np.ascontiguousarray(data["last"], dtype=np.int32)
+        stamps = np.ascontiguousarray(data["ts_100ns"], dtype=np.int64)
+        sizes = np.ascontiguousarray(data["volume"], dtype=np.int64)
+        count = len(prices)
+        if count == 0:
+            raise RuntimeError(f"Session {session_date} is empty")
+
+        await self.broadcast({
+            "type": "status",
+            "message": (
+                f"Building value-area profile for {session_date} "
+                f"({count:,} ticks)…"
+            ),
+        })
+
+        poc_arr, vah_arr, val_arr = await asyncio.to_thread(
+            rth_profile_for_session, prices, sizes, stamps
+        )
+
+        speed_key = str(speed).lower() if not isinstance(speed, (int, float)) else None
+        if speed_key in REPLAY_SPEEDS:
+            speed_factor = REPLAY_SPEEDS[speed_key]
+        else:
+            try:
+                speed_factor = float(speed)
+            except (TypeError, ValueError):
+                speed_factor = 50.0
+            if speed_factor <= 0:
+                speed_factor = None  # treat as max
+
+        await self.broadcast({
+            "type": "status",
+            "message": (
+                f"Replaying {session_date} at "
+                f"{'max' if speed_factor is None else f'{speed_factor:g}x'} speed"
+            ),
+        })
+
+        last_progress_pct = -1
+        last_ui_broadcast = 0.0
+        ui_interval = 0.05  # ~20 chart updates/sec max
+        NS_PER_SEC = 10_000_000
+
+        for i in range(count):
+            if not self.running:
+                break
+
+            price = int(prices[i])
+            ts = from_100ns(int(stamps[i])).astimezone(EASTERN)
+            t = ts.time()
+            is_rth = RTH_START <= t < RTH_END
+
+            self.engine.update_profile(
+                poc=int(poc_arr[i]),
+                vah=int(vah_arr[i]),
+                val=int(val_arr[i]),
+                ts=ts,
+            )
+            actions = self.engine.on_tick(price, ts, is_rth)
+
+            for action in actions:
+                await self.broadcast({"type": "action", "data": action})
+
+            now = asyncio.get_event_loop().time()
+            should_push_tick = (
+                actions
+                or i == 0
+                or i == count - 1
+                or (now - last_ui_broadcast) >= ui_interval
+            )
+            if should_push_tick:
+                await self.broadcast({
+                    "type": "tick",
+                    "price": price / 4.0,
+                    "timestamp": ts.isoformat(),
+                    "status": self.engine.get_status(),
+                })
+                last_ui_broadcast = now
+
+            pct = int((i + 1) * 100 / count)
+            if pct > last_progress_pct:
+                await self.broadcast({
+                    "type": "replay_progress",
+                    "session_date": session_date,
+                    "index": i + 1,
+                    "total": count,
+                    "pct": pct,
+                    "timestamp": ts.isoformat(),
+                })
+                last_progress_pct = pct
+
+            # Pace relative to recorded timestamps
+            if speed_factor is not None and i + 1 < count:
+                delta_ns = int(stamps[i + 1]) - int(stamps[i])
+                if delta_ns > 0:
+                    sleep_s = (delta_ns / NS_PER_SEC) / speed_factor
+                    # Cap pathological gaps (halts) so replay doesn't stall forever
+                    sleep_s = min(sleep_s, 0.5)
+                    if sleep_s > 0.0005:
+                        await asyncio.sleep(sleep_s)
+                    elif i % 500 == 0:
+                        await asyncio.sleep(0)
+                elif i % 500 == 0:
+                    await asyncio.sleep(0)
+            elif i % 2000 == 0:
+                await asyncio.sleep(0)
+
+        if self.running:
+            await self.broadcast({
+                "type": "replay_progress",
+                "session_date": session_date,
+                "index": count,
+                "total": count,
+                "pct": 100,
+                "done": True,
+            })
+            await self.broadcast({
+                "type": "status",
+                "message": f"Replay finished for {session_date}",
+            })
+        self.running = False
 
     async def _live_data_loop(self):
         """Live market data from Topstep SignalR hubs (not yet wired)."""
@@ -852,17 +1069,25 @@ async def websocket_endpoint(websocket: WebSocket):
             cmd = data.get("command")
             
             if cmd == "start":
-                test_mode = data.get("test_mode", True)
+                mode = data.get("mode")
+                if mode is None:
+                    mode = "test" if data.get("test_mode", True) else "live"
                 try:
-                    await manager.start_strategy(test_mode)
+                    await manager.start_strategy(
+                        mode=mode,
+                        session_date=data.get("session_date"),
+                        speed=data.get("speed", 50),
+                        test_mode=data.get("test_mode"),
+                    )
+                    label = mode
+                    if mode == "replay":
+                        label = f"replay {data.get('session_date')} @ {data.get('speed', 50)}x"
                     await websocket.send_json({
                         "type": "status",
-                        "message": (
-                            f"Strategy started "
-                            f"({'test' if test_mode else 'live'} mode)"
-                        ),
+                        "message": f"Strategy started ({label})",
                     })
                 except Exception as e:
+                    manager.running = False
                     await websocket.send_json({
                         "type": "status",
                         "message": f"Start failed: {e}",
@@ -911,6 +1136,18 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+
+
+@app.get("/api/sessions")
+async def get_sessions():
+    """List local historical sessions available for replay."""
+    sessions = list_sessions()
+    return {
+        "success": True,
+        "sessions_dir": str(SESSIONS_DIR),
+        "count": len(sessions),
+        "sessions": sessions,
+    }
 
 
 @app.get("/api/account")

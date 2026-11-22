@@ -7,6 +7,7 @@ import {
   CartesianGrid,
   Tooltip,
   ResponsiveContainer,
+  Legend,
 } from 'recharts';
 
 const WS_URL = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`;
@@ -14,13 +15,17 @@ const WS_URL = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${wind
 function App() {
   const [connected, setConnected] = useState(false);
   const [running, setRunning] = useState(false);
-  const [testMode, setTestMode] = useState(true);
+  const [mode, setMode] = useState('replay');
+  const [sessions, setSessions] = useState([]);
+  const [sessionDate, setSessionDate] = useState('');
+  const [speed, setSpeed] = useState('50');
   const [status, setStatus] = useState(null);
   const [trades, setTrades] = useState([]);
   const [ticks, setTicks] = useState([]);
   const [pnl, setPnl] = useState(0);
   const [toast, setToast] = useState(null);
   const [closing, setClosing] = useState(false);
+  const [replayProgress, setReplayProgress] = useState(null);
   const wsRef = useRef(null);
 
   useEffect(() => {
@@ -40,6 +45,28 @@ function App() {
     return () => ws.close();
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/sessions');
+        const data = await res.json();
+        if (cancelled || !data.success) return;
+        const list = data.sessions || [];
+        setSessions(list);
+        if (list.length && !sessionDate) {
+          const primary = list.find((s) => s.include_in_primary) || list[0];
+          setSessionDate(primary.date);
+        }
+      } catch {
+        // Backend may not be up yet; user can retry after starting main.py
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [connected]);
+
   const showToast = (message, error = false) => {
     setToast({ message, error });
     window.setTimeout(() => setToast(null), 4000);
@@ -50,11 +77,14 @@ function App() {
       case 'tick':
         setStatus(msg.status);
         setTicks((prev) => [
-          ...prev.slice(-100),
+          ...prev.slice(-200),
           {
             time: new Date(msg.timestamp).toLocaleTimeString(),
             price: msg.price,
             pnl: msg.status?.unrealized_pnl || 0,
+            poc: msg.status?.profile?.poc ?? null,
+            vah: msg.status?.profile?.vah ?? null,
+            val: msg.status?.profile?.val ?? null,
           },
         ]);
         break;
@@ -62,6 +92,12 @@ function App() {
         if (msg.data.action === 'trade_summary') {
           setTrades((prev) => [msg.data.data, ...prev]);
           setPnl((prev) => prev + msg.data.data.net_pnl);
+        }
+        break;
+      case 'replay_progress':
+        setReplayProgress(msg);
+        if (msg.done) {
+          setRunning(false);
         }
         break;
       case 'close_all_result':
@@ -74,6 +110,9 @@ function App() {
       case 'status':
         showToast(msg.message, String(msg.message || '').toLowerCase().includes('fail'));
         if (String(msg.message || '').toLowerCase().includes('start failed')) {
+          setRunning(false);
+        }
+        if (String(msg.message || '').toLowerCase().includes('replay finished')) {
           setRunning(false);
         }
         break;
@@ -92,11 +131,22 @@ function App() {
   };
 
   const startStrategy = () => {
+    if (mode === 'replay' && !sessionDate) {
+      showToast('Select a session date to replay', true);
+      return;
+    }
     setRunning(true);
     setTicks([]);
     setTrades([]);
     setPnl(0);
-    send({ command: 'start', test_mode: testMode });
+    setReplayProgress(null);
+    setStatus(null);
+    send({
+      command: 'start',
+      mode,
+      session_date: mode === 'replay' ? sessionDate : undefined,
+      speed: mode === 'replay' ? speed : undefined,
+    });
   };
 
   const stopStrategy = () => {
@@ -112,7 +162,6 @@ function App() {
 
     setClosing(true);
 
-    // Prefer live REST close so it works even if the strategy WS loop is idle.
     try {
       const res = await fetch('/api/positions/close-all', { method: 'POST' });
       const data = await res.json();
@@ -135,6 +184,10 @@ function App() {
   };
 
   const inPosition = Boolean(status?.in_position);
+  const canStart =
+    connected &&
+    !running &&
+    (mode !== 'replay' || Boolean(sessionDate));
 
   return (
     <div className="app">
@@ -153,28 +206,88 @@ function App() {
         <div className={`toast ${toast.error ? 'error' : ''}`}>{toast.message}</div>
       )}
 
+      {replayProgress && (
+        <div className="toast">
+          Replaying {replayProgress.session_date} · {replayProgress.pct}%
+          {replayProgress.done ? ' · done' : ''}
+        </div>
+      )}
+
       <section className="panel controls">
-        <label className="toggle">
-          <input
-            type="checkbox"
-            checked={testMode}
-            onChange={(e) => setTestMode(e.target.checked)}
-            disabled={running}
-          />
-          Test mode (simulated ticks)
-        </label>
+        <div className="mode-block">
+          <div className="mode-switch" role="group" aria-label="Strategy mode">
+            {[
+              { id: 'test', label: 'Test' },
+              { id: 'replay', label: 'Replay' },
+              { id: 'live', label: 'Live' },
+            ].map((opt) => (
+              <button
+                key={opt.id}
+                type="button"
+                className={`mode-btn ${mode === opt.id ? 'active' : ''}`}
+                disabled={running}
+                onClick={() => setMode(opt.id)}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+
+          {mode === 'replay' && (
+            <div className="replay-fields">
+              <label className="field">
+                <span>Session</span>
+                <select
+                  value={sessionDate}
+                  onChange={(e) => setSessionDate(e.target.value)}
+                  disabled={running || sessions.length === 0}
+                >
+                  {sessions.length === 0 && (
+                    <option value="">No sessions found</option>
+                  )}
+                  {sessions.map((s) => (
+                    <option key={s.date} value={s.date}>
+                      {s.date}
+                      {s.records ? ` · ${(s.records / 1e6).toFixed(2)}M ticks` : ''}
+                      {s.include_in_primary ? '' : ' · secondary'}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field">
+                <span>Speed</span>
+                <select
+                  value={speed}
+                  onChange={(e) => setSpeed(e.target.value)}
+                  disabled={running}
+                >
+                  <option value="10">10x</option>
+                  <option value="50">50x</option>
+                  <option value="max">Max</option>
+                </select>
+              </label>
+            </div>
+          )}
+
+          {mode === 'test' && (
+            <p className="mode-hint">Random-walk ticks with a fixed sample value area.</p>
+          )}
+          {mode === 'live' && (
+            <p className="mode-hint">TopstepX auth + orders. Market data hub not wired yet.</p>
+          )}
+        </div>
 
         {!running ? (
           <button
             className="btn btn-primary"
             onClick={startStrategy}
-            disabled={!connected}
+            disabled={!canStart}
           >
-            Start strategy
+            {mode === 'replay' ? 'Start replay' : 'Start strategy'}
           </button>
         ) : (
           <button className="btn btn-danger" onClick={stopStrategy}>
-            Stop strategy
+            Stop
           </button>
         )}
 
@@ -242,7 +355,11 @@ function App() {
         <h3 className="section-title">Price & P&L</h3>
         <div className="chart-wrap">
           {ticks.length === 0 ? (
-            <div className="empty">Start the strategy to stream ticks.</div>
+            <div className="empty">
+              {mode === 'replay'
+                ? 'Start a session replay to stream historical ticks.'
+                : 'Start the strategy to stream ticks.'}
+            </div>
           ) : (
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={ticks}>
@@ -275,21 +392,65 @@ function App() {
                     color: '#e8eef6',
                   }}
                 />
+                <Legend
+                  wrapperStyle={{ color: '#8b9bb0', fontSize: 12 }}
+                  iconType="plainline"
+                />
                 <Line
                   yAxisId="left"
                   type="monotone"
                   dataKey="price"
+                  name="Price"
                   stroke="#5b9cff"
                   strokeWidth={2}
                   dot={false}
+                  isAnimationActive={false}
+                />
+                <Line
+                  yAxisId="left"
+                  type="monotone"
+                  dataKey="poc"
+                  name="POC"
+                  stroke="#f0b429"
+                  strokeWidth={1.5}
+                  strokeDasharray="4 3"
+                  dot={false}
+                  connectNulls
+                  isAnimationActive={false}
+                />
+                <Line
+                  yAxisId="left"
+                  type="monotone"
+                  dataKey="vah"
+                  name="VAH"
+                  stroke="#3dd68c"
+                  strokeWidth={1.5}
+                  strokeDasharray="2 4"
+                  dot={false}
+                  connectNulls
+                  isAnimationActive={false}
+                />
+                <Line
+                  yAxisId="left"
+                  type="monotone"
+                  dataKey="val"
+                  name="VAL"
+                  stroke="#ff6b7a"
+                  strokeWidth={1.5}
+                  strokeDasharray="2 4"
+                  dot={false}
+                  connectNulls
+                  isAnimationActive={false}
                 />
                 <Line
                   yAxisId="right"
                   type="monotone"
                   dataKey="pnl"
-                  stroke="#3dd68c"
-                  strokeWidth={2}
+                  name="P&L"
+                  stroke="#8b9bb0"
+                  strokeWidth={1.5}
                   dot={false}
+                  isAnimationActive={false}
                 />
               </LineChart>
             </ResponsiveContainer>
