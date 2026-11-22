@@ -22,8 +22,10 @@ from zoneinfo import ZoneInfo
 
 from config import settings
 
+TOPSTEP_USERNAME = settings.topstep_username
 TOPSTEP_API_KEY = settings.topstep_api_key
-TOPSTEP_API_SECRET = settings.topstep_api_secret
+TOPSTEP_BASE_URL = settings.topstep_base_url
+TOPSTEP_ACCOUNT_ID = settings.topstep_account_id
 
 EASTERN = ZoneInfo("America/New_York")
 
@@ -424,72 +426,208 @@ class KTwoLot60Engine:
 
 
 # ============================================================================
-# Topstep API Client
+# TopstepX / ProjectX Gateway API Client
+# Docs: https://gateway.docs.projectx.com/  |  https://api.topstepx.com/swagger/index.html
 # ============================================================================
 
 class TopstepClient:
-    """Client for Topstep API."""
-    
-    def __init__(self, api_key: str, api_secret: str):
+    """Client for the TopstepX ProjectX Gateway REST API."""
+
+    ORDER_TYPE_LIMIT = 1
+    ORDER_TYPE_MARKET = 2
+    ORDER_TYPE_STOP = 4
+    ORDER_TYPE_TRAILING_STOP = 5
+    SIDE_BID = 0  # buy
+    SIDE_ASK = 1  # sell
+
+    def __init__(
+        self,
+        user_name: str,
+        api_key: str,
+        base_url: str = TOPSTEP_BASE_URL,
+        account_id: Optional[int] = None,
+    ):
+        self.user_name = user_name
         self.api_key = api_key
-        self.api_secret = api_secret
-        self.client = httpx.AsyncClient(base_url=TOPSTEP_BASE_URL)
-        self.ws: Optional[any] = None  # WebSocket connection
-        
+        self.account_id = account_id
+        self.token: Optional[str] = None
+        self.client = httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=30.0)
+
+    def _headers(self) -> dict:
+        if not self.token:
+            raise RuntimeError("Not authenticated — call authenticate() first")
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+            "accept": "text/plain",
+        }
+
     async def authenticate(self) -> bool:
-        """Authenticate with Topstep API."""
-        # Implement based on Topstep's actual auth flow
-        # Likely OAuth2 or API key + signature
+        """POST /api/Auth/loginKey — returns a JWT valid ~24h."""
         try:
             response = await self.client.post(
-                "/auth/token",
-                json={"api_key": self.api_key, "api_secret": self.api_secret}
+                "/api/Auth/loginKey",
+                json={"userName": self.user_name, "apiKey": self.api_key},
             )
             data = response.json()
-            self.access_token = data.get("access_token")
+            if not data.get("success") or not data.get("token"):
+                print(
+                    f"Auth failed: errorCode={data.get('errorCode')} "
+                    f"message={data.get('errorMessage')}"
+                )
+                return False
+
+            self.token = data["token"]
+
+            if self.account_id is None:
+                accounts = await self.search_accounts(only_active=True)
+                tradeable = [a for a in accounts if a.get("canTrade", True)]
+                chosen = tradeable[0] if tradeable else (accounts[0] if accounts else None)
+                if chosen:
+                    self.account_id = chosen["id"]
+                    print(f"Using Topstep account {self.account_id} ({chosen.get('name')})")
+                else:
+                    print("Auth ok but no accounts found")
+                    return False
             return True
         except Exception as e:
             print(f"Auth failed: {e}")
             return False
-    
-    async def get_account(self) -> dict:
-        """Get account information."""
-        response = await self.client.get(
-            "/account",
-            headers={"Authorization": f"Bearer {self.access_token}"}
+
+    async def validate_session(self) -> bool:
+        """POST /api/Auth/validate — refresh token before 24h expiry."""
+        response = await self.client.post("/api/Auth/validate", headers=self._headers())
+        data = response.json()
+        if data.get("success") and data.get("newToken"):
+            self.token = data["newToken"]
+            return True
+        return bool(data.get("success"))
+
+    async def search_accounts(self, only_active: bool = True) -> list[dict]:
+        """POST /api/Account/search"""
+        response = await self.client.post(
+            "/api/Account/search",
+            headers=self._headers(),
+            json={"onlyActiveAccounts": only_active},
         )
-        return response.json()
-    
-    async def place_order(self, symbol: str, side: str, quantity: int, 
-                         order_type: str = "market", price: Optional[float] = None) -> dict:
-        """Place an order."""
+        data = response.json()
+        if not data.get("success"):
+            raise RuntimeError(data.get("errorMessage") or "Account search failed")
+        return data.get("accounts") or []
+
+    async def get_account(self) -> dict:
+        accounts = await self.search_accounts(only_active=True)
+        for acct in accounts:
+            if self.account_id is None or acct.get("id") == self.account_id:
+                return acct
+        return accounts[0] if accounts else {"error": "No accounts"}
+
+    async def search_open_positions(self) -> list[dict]:
+        """POST /api/Position/searchOpen"""
+        if self.account_id is None:
+            raise RuntimeError("account_id is required")
+        response = await self.client.post(
+            "/api/Position/searchOpen",
+            headers=self._headers(),
+            json={"accountId": self.account_id},
+        )
+        data = response.json()
+        if not data.get("success"):
+            raise RuntimeError(data.get("errorMessage") or "Position search failed")
+        return data.get("positions") or []
+
+    async def search_open_orders(self) -> list[dict]:
+        """POST /api/Order/searchOpen"""
+        if self.account_id is None:
+            raise RuntimeError("account_id is required")
+        response = await self.client.post(
+            "/api/Order/searchOpen",
+            headers=self._headers(),
+            json={"accountId": self.account_id},
+        )
+        data = response.json()
+        if not data.get("success"):
+            raise RuntimeError(data.get("errorMessage") or "Open order search failed")
+        return data.get("orders") or []
+
+    async def place_order(
+        self,
+        contract_id: str,
+        side: int,
+        size: int,
+        order_type: int = ORDER_TYPE_MARKET,
+        limit_price: Optional[float] = None,
+        stop_price: Optional[float] = None,
+        custom_tag: Optional[str] = None,
+    ) -> dict:
+        """POST /api/Order/place"""
         payload = {
-            "symbol": symbol,
-            "side": side,  # "buy" or "sell"
-            "quantity": quantity,
+            "accountId": self.account_id,
+            "contractId": contract_id,
             "type": order_type,
-            "price": price
+            "side": side,
+            "size": size,
+            "limitPrice": limit_price,
+            "stopPrice": stop_price,
+            "trailPrice": None,
+            "customTag": custom_tag,
         }
         response = await self.client.post(
-            "/orders",
-            headers={"Authorization": f"Bearer {self.access_token}"},
-            json=payload
+            "/api/Order/place",
+            headers=self._headers(),
+            json=payload,
         )
         return response.json()
-    
-    async def cancel_order(self, order_id: str) -> dict:
-        """Cancel an order."""
-        response = await self.client.delete(
-            f"/orders/{order_id}",
-            headers={"Authorization": f"Bearer {self.access_token}"}
+
+    async def cancel_order(self, order_id: int) -> dict:
+        """POST /api/Order/cancel"""
+        response = await self.client.post(
+            "/api/Order/cancel",
+            headers=self._headers(),
+            json={"accountId": self.account_id, "orderId": order_id},
         )
         return response.json()
-    
-    async def connect_market_data(self, callback):
-        """Connect to market data WebSocket."""
-        # Implement WebSocket connection for real-time data
-        pass
-    
+
+    async def close_contract(self, contract_id: str) -> dict:
+        """POST /api/Position/closeContract — flatten one contract."""
+        response = await self.client.post(
+            "/api/Position/closeContract",
+            headers=self._headers(),
+            json={"accountId": self.account_id, "contractId": contract_id},
+        )
+        return response.json()
+
+    async def close_all_positions(self) -> dict:
+        """Cancel open orders, then close every open contract position."""
+        cancelled = []
+        closed = []
+
+        for order in await self.search_open_orders():
+            order_id = order.get("id")
+            if order_id is None:
+                continue
+            result = await self.cancel_order(order_id)
+            cancelled.append({"orderId": order_id, **result})
+
+        for position in await self.search_open_positions():
+            contract_id = position.get("contractId")
+            if not contract_id:
+                continue
+            result = await self.close_contract(contract_id)
+            closed.append({
+                "contractId": contract_id,
+                "size": position.get("size"),
+                "type": position.get("type"),
+                **result,
+            })
+
+        return {
+            "success": all(r.get("success", False) for r in closed) if closed else True,
+            "accountId": self.account_id,
+            "cancelledOrders": cancelled,
+            "closedPositions": closed,
+        }
+
     async def close(self):
         await self.client.aclose()
 
@@ -506,6 +644,7 @@ class ConnectionManager:
         self.engine: Optional[KTwoLot60Engine] = None
         self.topstep: Optional[TopstepClient] = None
         self.running = False
+        self.test_mode = True
         
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -522,65 +661,159 @@ class ConnectionManager:
         """Start the strategy engine."""
         self.engine = KTwoLot60Engine()
         self.running = True
-        
+        self.test_mode = test_mode
+
         if not test_mode:
-            self.topstep = TopstepClient(TOPSTEP_API_KEY, TOPSTEP_API_SECRET)
-            await self.topstep.authenticate()
-        
-        # Start market data loop
+            if not TOPSTEP_USERNAME or not TOPSTEP_API_KEY:
+                raise RuntimeError(
+                    "Live mode requires TOPSTEP_USERNAME and TOPSTEP_API_KEY in .env"
+                )
+            self.topstep = TopstepClient(
+                user_name=TOPSTEP_USERNAME,
+                api_key=TOPSTEP_API_KEY,
+                base_url=TOPSTEP_BASE_URL,
+                account_id=TOPSTEP_ACCOUNT_ID,
+            )
+            ok = await self.topstep.authenticate()
+            if not ok:
+                self.running = False
+                raise RuntimeError("TopstepX authentication failed")
+
         asyncio.create_task(self._market_data_loop(test_mode))
-        
+
+    async def ensure_topstep(self) -> TopstepClient:
+        """Authenticate a Topstep client even when the strategy is not running live."""
+        if self.topstep and self.topstep.token:
+            return self.topstep
+        if not TOPSTEP_USERNAME or not TOPSTEP_API_KEY:
+            raise RuntimeError(
+                "TOPSTEP_USERNAME and TOPSTEP_API_KEY are required in .env"
+            )
+        self.topstep = TopstepClient(
+            user_name=TOPSTEP_USERNAME,
+            api_key=TOPSTEP_API_KEY,
+            base_url=TOPSTEP_BASE_URL,
+            account_id=TOPSTEP_ACCOUNT_ID,
+        )
+        ok = await self.topstep.authenticate()
+        if not ok:
+            raise RuntimeError("TopstepX authentication failed")
+        return self.topstep
+
+    async def close_all_positions(self, price: Optional[int] = None) -> dict:
+        """Flatten broker positions (live) and/or local engine position (sim)."""
+        result = {
+            "engine": None,
+            "broker": None,
+        }
+
+        if self.engine and self.engine.position and self.engine.position.direction != 0:
+            fill_price = price if price is not None else (
+                self.engine.prev_price or self.engine.position.entry_price
+            )
+            ts = datetime.now(EASTERN)
+            actions = self.engine._close_all("manual_close", fill_price, ts)
+            for action in actions:
+                await self.broadcast({"type": "action", "data": action})
+            result["engine"] = {
+                "success": True,
+                "actions": actions,
+                "status": self.engine.get_status(),
+            }
+            await self.broadcast({
+                "type": "tick",
+                "price": fill_price / 4.0,
+                "timestamp": ts.isoformat(),
+                "status": self.engine.get_status(),
+            })
+
+        # Always attempt broker flatten when credentials are configured —
+        # emergency close should work even if the strategy is in test mode.
+        if TOPSTEP_USERNAME and TOPSTEP_API_KEY:
+            try:
+                client = await self.ensure_topstep()
+                result["broker"] = await client.close_all_positions()
+            except Exception as e:
+                result["broker"] = {"success": False, "error": str(e)}
+
+        if result["engine"] is None and result["broker"] is None:
+            return {"success": True, "message": "No open positions"}
+
+        broker_ok = (
+            result["broker"] is None
+            or result["broker"].get("success", False)
+            or (
+                not result["broker"].get("closedPositions")
+                and not result["broker"].get("error")
+            )
+        )
+        engine_ok = result["engine"] is None or result["engine"].get("success", False)
+        result["success"] = broker_ok and engine_ok
+        return result
+
     async def _market_data_loop(self, test_mode: bool):
         """Main loop for processing market data."""
         if test_mode:
             await self._simulated_data_loop()
         else:
             await self._live_data_loop()
-    
+
     async def _simulated_data_loop(self):
         """Simulated market data for testing."""
         import random
-        
-        # Initialize with sample profile
-        base_price = 85000  # ~212.50 in MNQ ticks
+
+        base_price = 85000  # ~21250.00 in MNQ points (ticks * 0.25)
         self.engine.update_profile(
             poc=base_price,
-            vah=base_price + 80,   # +20 points
-            val=base_price - 80,   # -20 points
-            timestamp=datetime.now(EASTERN)
+            vah=base_price + 80,
+            val=base_price - 80,
+            timestamp=datetime.now(EASTERN),
         )
-        
+
         price = base_price
         while self.running:
-            # Simulate random walk
             price += random.randint(-2, 2)
-            
+
             ts = datetime.now(EASTERN)
             is_rth = clock(9, 30) <= ts.time() < clock(16, 0)
-            
+
             actions = self.engine.on_tick(price, ts, is_rth)
-            
+
             for action in actions:
                 await self.broadcast({
                     "type": "action",
                     "data": action
                 })
-            
-            # Broadcast status every tick
+
             await self.broadcast({
                 "type": "tick",
                 "price": price / 4.0,
                 "timestamp": ts.isoformat(),
                 "status": self.engine.get_status()
             })
-            
-            await asyncio.sleep(0.1)  # 10 ticks per second
-    
+
+            await asyncio.sleep(0.1)
+
     async def _live_data_loop(self):
-        """Live market data from Topstep."""
-        # Implement actual WebSocket connection to Topstep
-        pass
-    
+        """Live market data from Topstep SignalR hubs (not yet wired)."""
+        await self.broadcast({
+            "type": "status",
+            "message": (
+                "Live mode authenticated. Wire rtc.topstepx.com SignalR hubs "
+                "for market data; REST order/position endpoints are ready."
+            ),
+        })
+        while self.running:
+            try:
+                if self.topstep:
+                    await self.topstep.validate_session()
+            except Exception as e:
+                await self.broadcast({
+                    "type": "status",
+                    "message": f"Session validate failed: {e}",
+                })
+            await asyncio.sleep(60)
+
     def stop(self):
         self.running = False
 
@@ -620,24 +853,32 @@ async def websocket_endpoint(websocket: WebSocket):
             
             if cmd == "start":
                 test_mode = data.get("test_mode", True)
-                await manager.start_strategy(test_mode)
-                await websocket.send_json({
-                    "type": "status",
-                    "message": f"Strategy started ({'test' if test_mode else 'live'} mode)"
-                })
-                
+                try:
+                    await manager.start_strategy(test_mode)
+                    await websocket.send_json({
+                        "type": "status",
+                        "message": (
+                            f"Strategy started "
+                            f"({'test' if test_mode else 'live'} mode)"
+                        ),
+                    })
+                except Exception as e:
+                    await websocket.send_json({
+                        "type": "status",
+                        "message": f"Start failed: {e}",
+                    })
+
             elif cmd == "stop":
                 manager.stop()
                 await websocket.send_json({
                     "type": "status",
                     "message": "Strategy stopped"
                 })
-                
+
             elif cmd == "update_profile":
-                # Manual profile update from UI
                 if manager.engine:
                     manager.engine.update_profile(
-                        poc=int(data["poc"] * 4),  # Convert points to ticks
+                        poc=int(data["poc"] * 4),
                         vah=int(data["vah"] * 4),
                         val=int(data["val"] * 4),
                         timestamp=datetime.fromisoformat(data["timestamp"])
@@ -649,17 +890,57 @@ async def websocket_endpoint(websocket: WebSocket):
                         "type": "status",
                         "data": manager.engine.get_status()
                     })
-                    
+
+            elif cmd == "close_all":
+                try:
+                    result = await manager.close_all_positions()
+                    await websocket.send_json({
+                        "type": "close_all_result",
+                        "data": result,
+                        "message": (
+                            "All positions closed"
+                            if result.get("success")
+                            else "Close-all finished with errors"
+                        ),
+                    })
+                except Exception as e:
+                    await websocket.send_json({
+                        "type": "status",
+                        "message": f"Close all failed: {e}",
+                    })
+
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
 
 @app.get("/api/account")
 async def get_account():
-    """Get Topstep account info."""
-    if manager.topstep:
-        return await manager.topstep.get_account()
-    return {"error": "Not connected"}
+    """Get TopstepX account info via POST /api/Account/search."""
+    try:
+        client = await manager.ensure_topstep()
+        return await client.get_account()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/positions")
+async def get_positions():
+    """List open positions via POST /api/Position/searchOpen."""
+    try:
+        client = await manager.ensure_topstep()
+        positions = await client.search_open_positions()
+        return {"success": True, "positions": positions, "accountId": client.account_id}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/positions/close-all")
+async def close_all_positions():
+    """Flatten all open positions (engine + broker)."""
+    try:
+        return await manager.close_all_positions()
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 if __name__ == "__main__":
