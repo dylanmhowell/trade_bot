@@ -9,6 +9,7 @@ import {
   ResponsiveContainer,
   Legend,
 } from 'recharts';
+import { playTradeAction } from './sounds.js';
 
 const WS_URL = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`;
 
@@ -26,7 +27,13 @@ function App() {
   const [toast, setToast] = useState(null);
   const [closing, setClosing] = useState(false);
   const [replayProgress, setReplayProgress] = useState(null);
+  const [soundOn, setSoundOn] = useState(true);
   const wsRef = useRef(null);
+  const soundOnRef = useRef(true);
+
+  useEffect(() => {
+    soundOnRef.current = soundOn;
+  }, [soundOn]);
 
   useEffect(() => {
     const ws = new WebSocket(WS_URL);
@@ -88,6 +95,9 @@ function App() {
         ]);
         break;
       case 'action':
+        if (soundOnRef.current) {
+          playTradeAction(msg.data);
+        }
         if (msg.data.action === 'trade_summary') {
           setTrades((prev) => [msg.data.data, ...prev]);
           setPnl((prev) => prev + msg.data.data.net_pnl);
@@ -315,6 +325,15 @@ function App() {
           title="Flatten positions and cancel open orders"
         >
           {closing ? 'Closing…' : 'Close all positions'}
+        </button>
+
+        <button
+          type="button"
+          className={`btn btn-ghost ${soundOn ? 'active-sound' : ''}`}
+          onClick={() => setSoundOn((v) => !v)}
+          title="Toggle trade sounds"
+        >
+          {soundOn ? 'Sound on' : 'Sound off'}
         </button>
       </section>
 
