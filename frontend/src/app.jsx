@@ -106,6 +106,22 @@ function App() {
         }
         showToast(msg.message || 'Close all finished', !msg.data?.success);
         break;
+      case 'broker': {
+        const broker = msg.data?.broker;
+        const skipped = msg.data?.skipped;
+        if (skipped) {
+          showToast(`Order skipped: ${msg.data?.reason || 'disabled'}`);
+        } else if (broker) {
+          const ok = broker.success !== false;
+          showToast(
+            ok
+              ? `Broker ${msg.data?.action || 'order'} ok`
+              : `Broker error: ${broker.errorMessage || broker.errorCode || 'failed'}`,
+            !ok
+          );
+        }
+        break;
+      }
       case 'status':
         showToast(msg.message, String(msg.message || '').toLowerCase().includes('fail'));
         if (String(msg.message || '').toLowerCase().includes('start failed')) {
@@ -272,7 +288,9 @@ function App() {
             <p className="mode-hint">Random-walk ticks with a fixed sample value area.</p>
           )}
           {mode === 'live' && (
-            <p className="mode-hint">TopstepX auth + orders. Market data hub not wired yet.</p>
+            <p className="mode-hint">
+              Seeds today&apos;s VA from Topstep history before enabling entries, then streams live MNQ trades.
+            </p>
           )}
         </div>
 

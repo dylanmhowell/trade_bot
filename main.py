@@ -2,9 +2,10 @@
 
 import asyncio
 import json
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, asdict
-from datetime import datetime, time as clock, timezone
+from datetime import datetime, time as clock, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
@@ -16,6 +17,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from zoneinfo import ZoneInfo
 
 from backtest_va import from_100ns, rth_profile_for_session
+from topstep_live import (
+    DevelopingValueArea,
+    TopstepMarketHub,
+    price_to_ticks,
+    seed_value_area_from_bars,
+    ticks_to_price,
+    trade_from_payload,
+)
 
 
 # ============================================================================
@@ -28,6 +37,11 @@ TOPSTEP_USERNAME = settings.topstep_username
 TOPSTEP_API_KEY = settings.topstep_api_key
 TOPSTEP_BASE_URL = settings.topstep_base_url
 TOPSTEP_ACCOUNT_ID = settings.topstep_account_id
+TOPSTEP_CONTRACT_ID = settings.topstep_contract_id
+TOPSTEP_SYMBOL_SEARCH = settings.topstep_symbol_search
+TOPSTEP_CONTRACT_LIVE = settings.topstep_contract_live
+TOPSTEP_RTC_URL = settings.topstep_rtc_url
+TOPSTEP_ENABLE_ORDERS = settings.topstep_enable_orders
 
 EASTERN = ZoneInfo("America/New_York")
 
@@ -136,6 +150,8 @@ class KTwoLot60Engine:
         self.daily_realized_cents = 0
         self.equity_peak_cents = 0
         self.max_drawdown_cents = 0
+        # Live mode clears this until today's VA has been seeded from history
+        self.entries_enabled = True
 
     def update_profile(self, poc: int, vah: int, val: int, ts: datetime):
         """Update value area profile from external source."""
@@ -171,7 +187,8 @@ class KTwoLot60Engine:
 
         # Check for entry (must already be armed from a POC cross)
         if (
-            self.state in (State.ARMED_SHORT, State.ARMED_LONG)
+            self.entries_enabled
+            and self.state in (State.ARMED_SHORT, State.ARMED_LONG)
             and self.entry_window_open
             and not self.position
         ):
@@ -452,6 +469,7 @@ class KTwoLot60Engine:
             "daily_pnl": daily_pnl / 100.0,
             "realized_pnl": self.daily_realized_cents / 100.0,
             "max_drawdown": self.max_drawdown_cents / 100.0,
+            "entries_enabled": self.entries_enabled,
             "daily_trades": len(self.daily_trades),
             "total_commission": self.total_commission_cents / 100.0,
             "profile": {
@@ -634,6 +652,164 @@ class TopstepClient:
         )
         return response.json()
 
+    async def partial_close_contract(self, contract_id: str, size: int) -> dict:
+        """POST /api/Position/partialCloseContract"""
+        response = await self.client.post(
+            "/api/Position/partialCloseContract",
+            headers=self._headers(),
+            json={
+                "accountId": self.account_id,
+                "contractId": contract_id,
+                "size": size,
+            },
+        )
+        return response.json()
+
+    async def search_contracts(
+        self, search_text: str, live: bool = False
+    ) -> list[dict]:
+        """POST /api/Contract/search"""
+        response = await self.client.post(
+            "/api/Contract/search",
+            headers=self._headers(),
+            json={"searchText": search_text, "live": live},
+        )
+        data = response.json()
+        if not data.get("success"):
+            raise RuntimeError(data.get("errorMessage") or "Contract search failed")
+        return data.get("contracts") or []
+
+    async def retrieve_bars(
+        self,
+        contract_id: str,
+        start_time: datetime,
+        end_time: datetime,
+        unit: int = 1,
+        unit_number: int = 1,
+        limit: int = 20000,
+        live: Optional[bool] = None,
+        include_partial_bar: bool = True,
+    ) -> list[dict]:
+        """POST /api/History/retrieveBars (max 20,000 bars per request)."""
+        if live is None:
+            live = TOPSTEP_CONTRACT_LIVE
+        response = await self.client.post(
+            "/api/History/retrieveBars",
+            headers=self._headers(),
+            json={
+                "contractId": contract_id,
+                "live": live,
+                "startTime": start_time.isoformat(),
+                "endTime": end_time.isoformat(),
+                "unit": unit,
+                "unitNumber": unit_number,
+                "limit": limit,
+                "includePartialBar": include_partial_bar,
+            },
+        )
+        data = response.json()
+        if not data.get("success"):
+            raise RuntimeError(
+                data.get("errorMessage")
+                or f"retrieveBars failed (errorCode={data.get('errorCode')})"
+            )
+        return data.get("bars") or []
+
+    async def resolve_contract(
+        self,
+        contract_id: Optional[str] = None,
+        search_text: str = "MNQ",
+        live: bool = False,
+    ) -> dict:
+        """Resolve an explicit contract id or the active front-month match."""
+        if contract_id:
+            response = await self.client.post(
+                "/api/Contract/searchById",
+                headers=self._headers(),
+                json={"contractId": contract_id},
+            )
+            data = response.json()
+            if data.get("success") and data.get("contract"):
+                return data["contract"]
+            raise RuntimeError(f"Contract not found: {contract_id}")
+
+        contracts = await self.search_contracts(search_text, live=live)
+        if not contracts and live:
+            # Practice accounts often only resolve with live=false
+            contracts = await self.search_contracts(search_text, live=False)
+
+        needle = search_text.upper()
+        preferred = [
+            c
+            for c in contracts
+            if c.get("activeContract")
+            and (
+                needle in str(c.get("name", "")).upper()
+                or needle in str(c.get("symbolId", "")).upper()
+                or needle in str(c.get("id", "")).upper()
+            )
+        ]
+        if not preferred:
+            preferred = [c for c in contracts if c.get("activeContract")]
+        if not preferred and contracts:
+            preferred = contracts
+        if not preferred:
+            raise RuntimeError(f"No contracts found for search '{search_text}'")
+        return preferred[0]
+
+    async def execute_strategy_action(
+        self, action: dict, contract_id: str, enable_orders: bool = True
+    ) -> Optional[dict]:
+        """Map engine enter/exit actions onto Topstep order/position endpoints."""
+        kind = action.get("action")
+        if kind not in ("enter", "exit"):
+            return None
+
+        if not enable_orders:
+            return {
+                "skipped": True,
+                "reason": "TOPSTEP_ENABLE_ORDERS=false",
+                "action": kind,
+            }
+
+        if kind == "enter":
+            side = (
+                self.SIDE_BID
+                if action.get("direction") == "long"
+                else self.SIDE_ASK
+            )
+            size = int(action.get("quantity") or LOTS)
+            result = await self.place_order(
+                contract_id=contract_id,
+                side=side,
+                size=size,
+                order_type=self.ORDER_TYPE_MARKET,
+                custom_tag=f"enter-{uuid.uuid4().hex[:12]}",
+            )
+            return {"action": "enter", "broker": result}
+
+        # Exit one strategy leg (1 contract) via partial close when possible.
+        size = 1
+        reason = action.get("reason")
+        if reason in ("session_close", "manual_close"):
+            result = await self.close_contract(contract_id)
+            return {"action": "exit", "broker": result, "mode": "closeContract"}
+
+        result = await self.partial_close_contract(contract_id, size=size)
+        if not result.get("success"):
+            # Fall back to opposite-side market order
+            direction = action.get("direction")
+            # Engine exit actions don't always include direction; infer from side needed
+            # Prefer closeContract as last resort
+            fallback = await self.close_contract(contract_id)
+            return {
+                "action": "exit",
+                "broker": fallback,
+                "mode": "closeContract_fallback",
+                "partial": result,
+            }
+        return {"action": "exit", "broker": result, "mode": "partialClose"}
+
     async def close_all_positions(self) -> dict:
         """Cancel open orders, then close every open contract position."""
         cancelled = []
@@ -721,6 +897,10 @@ class ConnectionManager:
         self.test_mode = True
         self.mode = "test"
         self.replay_task: Optional[asyncio.Task] = None
+        self.contract_id: Optional[str] = None
+        self.market_hub: Optional[TopstepMarketHub] = None
+        self.value_area = DevelopingValueArea()
+        self._live_queue: Optional[asyncio.Queue] = None
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -1043,28 +1223,331 @@ class ConnectionManager:
             })
         self.running = False
 
-    async def _live_data_loop(self):
-        """Live market data from Topstep SignalR hubs (not yet wired)."""
+    async def _execute_live_actions(self, actions: list[dict]):
+        """Broadcast engine actions and optionally place broker orders."""
+        for action in actions:
+            await self.broadcast({"type": "action", "data": action})
+
+        if (
+            self.mode != "live"
+            or not self.topstep
+            or not self.contract_id
+            or not actions
+        ):
+            return
+
+        enters = [a for a in actions if a.get("action") == "enter"]
+        exits = [a for a in actions if a.get("action") == "exit"]
+
+        try:
+            for action in enters:
+                result = await self.topstep.execute_strategy_action(
+                    action,
+                    contract_id=self.contract_id,
+                    enable_orders=TOPSTEP_ENABLE_ORDERS,
+                )
+                if result:
+                    await self.broadcast({"type": "broker", "data": result})
+
+            if exits:
+                flatten = any(
+                    a.get("reason") in ("session_close", "manual_close")
+                    for a in exits
+                )
+                if flatten:
+                    result = await self.topstep.execute_strategy_action(
+                        {"action": "exit", "reason": "session_close"},
+                        contract_id=self.contract_id,
+                        enable_orders=TOPSTEP_ENABLE_ORDERS,
+                    )
+                    if result:
+                        await self.broadcast({"type": "broker", "data": result})
+                else:
+                    for action in exits:
+                        result = await self.topstep.execute_strategy_action(
+                            action,
+                            contract_id=self.contract_id,
+                            enable_orders=TOPSTEP_ENABLE_ORDERS,
+                        )
+                        if result:
+                            await self.broadcast({"type": "broker", "data": result})
+        except Exception as e:
+            await self.broadcast({
+                "type": "status",
+                "message": f"Broker action error: {e}",
+            })
+
+    async def _broadcast_live_tick(self, price: float, ts: datetime, force: bool = False):
+        if not self.engine:
+            return
+        now = asyncio.get_running_loop().time()
+        last = getattr(self, "_last_live_tick_broadcast", 0.0)
+        if not force and (now - last) < 0.1:
+            return
+        self._last_live_tick_broadcast = now
+        await self.broadcast({
+            "type": "tick",
+            "price": price,
+            "timestamp": ts.isoformat(),
+            "status": self.engine.get_status(),
+        })
+
+    async def _process_live_trade(self, payload: dict):
+        trade = trade_from_payload(payload)
+        if not trade or not self.engine:
+            return
+        # Ignore live prints until history seeding finishes
+        if not self.engine.entries_enabled and not getattr(self, "_live_seed_done", False):
+            return
+
+        self.value_area.maybe_roll_day(trade.timestamp)
+        profile = self.value_area.add(trade.price_ticks, trade.volume)
+        if profile:
+            poc, vah, val = profile
+            self.engine.update_profile(poc=poc, vah=vah, val=val, ts=trade.timestamp)
+
+        t = trade.timestamp.astimezone(EASTERN).time()
+        is_rth = RTH_START <= t < RTH_END
+        actions = self.engine.on_tick(trade.price_ticks, trade.timestamp, is_rth)
+        await self._execute_live_actions(actions)
+        await self._broadcast_live_tick(
+            trade.raw_price, trade.timestamp, force=bool(actions)
+        )
+
+    async def _seed_live_value_area(self, contract_id: str) -> dict:
+        """Rebuild today's RTH VA from History/retrieveBars before trading."""
+        now = datetime.now(EASTERN)
+        day = now.date()
+        rth_open = datetime.combine(day, RTH_START, tzinfo=EASTERN)
+        rth_end = datetime.combine(day, RTH_END, tzinfo=EASTERN)
+        end = min(now, rth_end)
+
+        if now < rth_open:
+            return {
+                "seeded": False,
+                "reason": "before_rth",
+                "bars": 0,
+                "message": "Before RTH open — VA will build from live trades",
+            }
+
         await self.broadcast({
             "type": "status",
             "message": (
-                "Live mode authenticated. Wire rtc.topstepx.com SignalR hubs "
-                "for market data; REST order/position endpoints are ready."
+                f"Seeding value area from {rth_open.strftime('%H:%M')} ET "
+                f"→ {end.strftime('%H:%M')} ET (no trades until ready)…"
             ),
         })
-        while self.running:
+
+        # 1-second bars; chunk to stay under the 20k bar API limit
+        chunk = timedelta(seconds=15_000)
+        cursor = rth_open
+        all_bars: list[dict] = []
+        while cursor < end and self.running:
+            chunk_end = min(cursor + chunk, end)
             try:
-                if self.topstep:
-                    await self.topstep.validate_session()
+                bars = await self.topstep.retrieve_bars(
+                    contract_id=contract_id,
+                    start_time=cursor.astimezone(timezone.utc),
+                    end_time=chunk_end.astimezone(timezone.utc),
+                    unit=1,
+                    unit_number=1,
+                    limit=20000,
+                    live=TOPSTEP_CONTRACT_LIVE,
+                    include_partial_bar=True,
+                )
             except Exception as e:
+                # Fall back to 1-minute bars if second bars are unavailable
                 await self.broadcast({
                     "type": "status",
-                    "message": f"Session validate failed: {e}",
+                    "message": f"1s history failed ({e}); retrying with 1-minute bars…",
                 })
-            await asyncio.sleep(60)
+                bars = await self.topstep.retrieve_bars(
+                    contract_id=contract_id,
+                    start_time=rth_open.astimezone(timezone.utc),
+                    end_time=end.astimezone(timezone.utc),
+                    unit=2,
+                    unit_number=1,
+                    limit=20000,
+                    live=TOPSTEP_CONTRACT_LIVE,
+                    include_partial_bar=True,
+                )
+                all_bars = bars
+                break
+            all_bars.extend(bars)
+            cursor = chunk_end
+
+        profile, last_close, used = await asyncio.to_thread(
+            seed_value_area_from_bars, self.value_area, all_bars
+        )
+
+        ts = end
+        if profile:
+            poc, vah, val = profile
+            self.engine.update_profile(poc=poc, vah=vah, val=val, ts=ts)
+            if last_close is not None:
+                px = price_to_ticks(last_close)
+                self.engine.prev_price = px
+                if px > poc:
+                    self.engine.origin = 1
+                elif px < poc:
+                    self.engine.origin = -1
+                else:
+                    self.engine.origin = 0
+            await self._broadcast_live_tick(last_close or ticks_to_price(poc), ts, force=True)
+
+        return {
+            "seeded": used > 0,
+            "bars": used,
+            "profile": {
+                "poc": self.engine.profile.poc / 4.0,
+                "vah": self.engine.profile.vah / 4.0,
+                "val": self.engine.profile.val / 4.0,
+            }
+            if self.engine.profile.poc
+            else None,
+            "message": (
+                f"VA seeded from {used:,} bars"
+                if used
+                else "No history bars returned — VA will build from live trades"
+            ),
+        }
+
+    async def _process_live_quote(self, payload: dict):
+        """UI mark from quotes only — strategy is driven by trades."""
+        if not self.engine:
+            return
+        last = payload.get("lastPrice")
+        if last is None:
+            bid = payload.get("bestBid")
+            ask = payload.get("bestAsk")
+            if bid is None or ask is None:
+                return
+            last = (float(bid) + float(ask)) / 2.0
+
+        ts = datetime.now(EASTERN)
+        raw = payload.get("timestamp")
+        if raw:
+            try:
+                ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=EASTERN)
+            except ValueError:
+                pass
+
+        # Refresh mark for unrealized P&L only; do not drive entry crosses from quotes
+        if self.engine.position:
+            self.engine.prev_price = price_to_ticks(float(last))
+        await self._broadcast_live_tick(float(last), ts)
+
+    async def _live_data_loop(self):
+        """Live TopstepX quotes/trades via SignalR + REST order routing."""
+        if not self.topstep:
+            raise RuntimeError("Topstep client not authenticated")
+
+        contract = await self.topstep.resolve_contract(
+            contract_id=TOPSTEP_CONTRACT_ID or None,
+            search_text=TOPSTEP_SYMBOL_SEARCH,
+            live=TOPSTEP_CONTRACT_LIVE,
+        )
+        self.contract_id = contract["id"]
+        self.value_area = DevelopingValueArea()
+        self._live_queue = asyncio.Queue(maxsize=5000)
+        self._live_seed_done = False
+        self.engine.entries_enabled = False
+
+        await self.broadcast({
+            "type": "status",
+            "message": (
+                f"Live mode on {contract.get('name')} ({self.contract_id}) "
+                f"account={self.topstep.account_id} "
+                f"orders={'ON' if TOPSTEP_ENABLE_ORDERS else 'OFF'}"
+            ),
+        })
+
+        # Rebuild today's VA before connecting the trade stream / allowing entries
+        try:
+            seed = await self._seed_live_value_area(self.contract_id)
+            await self.broadcast({
+                "type": "status",
+                "message": seed.get("message") or "VA seed finished",
+            })
+            if seed.get("profile"):
+                await self.broadcast({
+                    "type": "status",
+                    "message": (
+                        f"Seeded POC {seed['profile']['poc']:.2f} · "
+                        f"VAH {seed['profile']['vah']:.2f} · "
+                        f"VAL {seed['profile']['val']:.2f}"
+                    ),
+                })
+        except Exception as e:
+            await self.broadcast({
+                "type": "status",
+                "message": f"VA seed failed ({e}); continuing with live-only profile",
+            })
+
+        self._live_seed_done = True
+        self.engine.entries_enabled = True
+        await self.broadcast({
+            "type": "status",
+            "message": "VA ready — entries enabled",
+        })
+
+        loop = asyncio.get_running_loop()
+        self.market_hub = TopstepMarketHub(
+            token_factory=lambda: self.topstep.token,
+            contract_id=self.contract_id,
+            event_queue=self._live_queue,
+            loop=loop,
+            hub_url=TOPSTEP_RTC_URL,
+        )
+        await asyncio.to_thread(self.market_hub.start)
+
+        last_validate = loop.time()
+        try:
+            while self.running:
+                try:
+                    event = await asyncio.wait_for(
+                        self._live_queue.get(), timeout=1.0
+                    )
+                except asyncio.TimeoutError:
+                    event = None
+
+                if event:
+                    kind = event[0]
+                    if kind == "status":
+                        await self.broadcast({
+                            "type": "status",
+                            "message": event[1],
+                        })
+                    elif kind == "trade":
+                        await self._process_live_trade(event[2])
+                    elif kind == "quote":
+                        await self._process_live_quote(event[2])
+
+                now = loop.time()
+                if now - last_validate > 60 * 30:
+                    try:
+                        await self.topstep.validate_session()
+                    except Exception as e:
+                        await self.broadcast({
+                            "type": "status",
+                            "message": f"Session validate failed: {e}",
+                        })
+                    last_validate = now
+        finally:
+            if self.market_hub:
+                await asyncio.to_thread(self.market_hub.stop)
+                self.market_hub = None
 
     def stop(self):
         self.running = False
+        if self.market_hub:
+            try:
+                self.market_hub.stop()
+            except Exception:
+                pass
+            self.market_hub = None
 
 
 manager = ConnectionManager()

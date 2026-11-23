@@ -11,6 +11,17 @@ class Settings(BaseSettings):
     topstep_base_url: str = "https://api.topstepx.com"
     topstep_account_id: int | None = None
 
+    # Market data / contract selection
+    # Practice/sim accounts usually need live=false on Contract/search
+    topstep_contract_id: str = ""
+    topstep_symbol_search: str = "MNQ"
+    topstep_contract_live: bool = False
+    topstep_rtc_url: str = "https://rtc.topstepx.com/hubs/market"
+
+    # When true, live-mode strategy actions place real broker orders
+    # (still only against whatever account Topstep returns — often simulated)
+    topstep_enable_orders: bool = True
+
     # Strategy parameters (can also come from env)
     stop_ticks: int = 240
     lots: int = 2
