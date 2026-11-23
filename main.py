@@ -133,35 +133,42 @@ class KTwoLot60Engine:
         # Statistics
         self.daily_trades: list[TradeSummary] = []
         self.total_commission_cents = 0
-        
+        self.daily_realized_cents = 0
+        self.equity_peak_cents = 0
+        self.max_drawdown_cents = 0
+
     def update_profile(self, poc: int, vah: int, val: int, ts: datetime):
         """Update value area profile from external source."""
         self.profile = Profile(poc=poc, vah=vah, val=val, timestamp=ts)
-        
+
     def on_tick(self, price: int, ts: datetime, is_rth: bool) -> list[dict]:
         """Process a single tick. Returns list of actions to execute."""
         actions = []
-        
+
         # Update session timing
         self._update_session_state(ts, is_rth)
-        
+
         if not is_rth:
             # Force close any position at RTH end
             if self.position and self.position.direction != 0:
                 actions.extend(self._close_all("session_close", price, ts))
+            self.prev_price = price
+            self._mark_equity(self._unrealized_cents())
             return actions
-        
+
         # Update crossing state
         self._update_crossing_state(price)
-        
+
         # Check for exits first
         if self.position and self.position.direction != 0:
             exit_actions = self._check_exits(price, ts)
             if exit_actions:
                 actions.extend(exit_actions)
                 if self.state == State.FLAT:
+                    self.prev_price = price
+                    self._mark_equity(self._unrealized_cents())
                     return actions  # Position closed
-        
+
         # Check for entry (must already be armed from a POC cross)
         if (
             self.state in (State.ARMED_SHORT, State.ARMED_LONG)
@@ -171,23 +178,47 @@ class KTwoLot60Engine:
             entry_action = self._check_entry(price, ts)
             if entry_action:
                 actions.append(entry_action)
-        
+
         self.prev_price = price
+        self._mark_equity(self._unrealized_cents())
         return actions
-    
+
     def _update_session_state(self, ts: datetime, is_rth: bool):
         """Update entry window and RTH state."""
         self.rth_active = is_rth
-        
+
         t = ts.astimezone(EASTERN).time()
         date = ts.astimezone(EASTERN).date().isoformat()
-        
+
         if date != self.session_date:
             self.session_date = date
             self.daily_trades = []
-        
+            self.daily_realized_cents = 0
+            self.equity_peak_cents = 0
+            self.max_drawdown_cents = 0
+            self.total_commission_cents = 0
+
         entry_start = clock(ENTRY_HOUR, ENTRY_MINUTE)
         self.entry_window_open = entry_start <= t < ENTRY_END
+
+    def _unrealized_cents(self) -> int:
+        if not self.position or self.prev_price is None:
+            return 0
+        unrealized = 0
+        for leg in self.position.legs:
+            if leg.open:
+                ch = (self.prev_price - self.position.entry_price) * self.position.direction
+                unrealized += ch * TICK_CENTS
+        return unrealized
+
+    def _mark_equity(self, unrealized_cents: int):
+        """Track peak equity and max drawdown for the session day."""
+        equity = self.daily_realized_cents + unrealized_cents
+        if equity > self.equity_peak_cents:
+            self.equity_peak_cents = equity
+        drawdown = self.equity_peak_cents - equity
+        if drawdown > self.max_drawdown_cents:
+            self.max_drawdown_cents = drawdown
     
     def _update_crossing_state(self, price: int):
         """Update POC crossing armed state."""
@@ -398,28 +429,29 @@ class KTwoLot60Engine:
         )
         
         self.daily_trades.append(summary)
-        
+        self.daily_realized_cents += net
+
         return [{
             "action": "trade_summary",
             "data": asdict(summary)
         }]
-    
+
     def get_status(self) -> dict:
         """Get current engine status."""
-        unrealized = 0
-        if self.position and self.prev_price:
-            for leg in self.position.legs:
-                if leg.open:
-                    ch = (self.prev_price - self.position.entry_price) * self.position.direction
-                    unrealized += ch * TICK_CENTS
-        
+        unrealized = self._unrealized_cents()
+        self._mark_equity(unrealized)
+        daily_pnl = self.daily_realized_cents + unrealized
+
         return {
             "state": self.state.value,
             "in_position": self.position is not None and self.position.direction != 0,
-            "direction": "long" if self.position and self.position.direction == 1 else 
+            "direction": "long" if self.position and self.position.direction == 1 else
                         "short" if self.position and self.position.direction == -1 else "flat",
             "entry_price": self.position.entry_price / 4.0 if self.position else 0,
             "unrealized_pnl": unrealized / 100.0,
+            "daily_pnl": daily_pnl / 100.0,
+            "realized_pnl": self.daily_realized_cents / 100.0,
+            "max_drawdown": self.max_drawdown_cents / 100.0,
             "daily_trades": len(self.daily_trades),
             "total_commission": self.total_commission_cents / 100.0,
             "profile": {

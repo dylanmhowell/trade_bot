@@ -320,13 +320,23 @@ function App() {
           />
           <StatusCard
             title="Unrealized P&L"
-            value={`$${status.unrealized_pnl.toFixed(2)}`}
-            color={status.unrealized_pnl >= 0 ? 'var(--green)' : 'var(--red)'}
+            value={`$${Number(status.unrealized_pnl || 0).toFixed(2)}`}
+            color={(status.unrealized_pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)'}
+          />
+          <StatusCard
+            title="Daily P&L"
+            value={`$${Number(status.daily_pnl || 0).toFixed(2)}`}
+            color={(status.daily_pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)'}
+          />
+          <StatusCard
+            title="Max drawdown"
+            value={`-$${Number(status.max_drawdown || 0).toFixed(2)}`}
+            color={(status.max_drawdown || 0) > 0 ? 'var(--red)' : 'var(--text-dim)'}
           />
           <StatusCard title="Daily trades" value={status.daily_trades} />
           <StatusCard
             title="Commission"
-            value={`$${status.total_commission.toFixed(2)}`}
+            value={`$${Number(status.total_commission || 0).toFixed(2)}`}
           />
         </section>
       )}
