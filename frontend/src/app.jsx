@@ -81,7 +81,6 @@ function App() {
           {
             time: new Date(msg.timestamp).toLocaleTimeString(),
             price: msg.price,
-            pnl: msg.status?.unrealized_pnl || 0,
             poc: msg.status?.profile?.poc ?? null,
             vah: msg.status?.profile?.vah ?? null,
             val: msg.status?.profile?.val ?? null,
@@ -362,7 +361,7 @@ function App() {
       )}
 
       <section className="panel chart-panel">
-        <h3 className="section-title">Price & P&L</h3>
+        <h3 className="section-title">Price</h3>
         <div className="chart-wrap">
           {ticks.length === 0 ? (
             <div className="empty">
@@ -381,18 +380,10 @@ function App() {
                   minTickGap={24}
                 />
                 <YAxis
-                  yAxisId="left"
                   domain={['auto', 'auto']}
                   stroke="#5f7085"
                   tick={{ fill: '#8b9bb0', fontSize: 11 }}
                   width={64}
-                />
-                <YAxis
-                  yAxisId="right"
-                  orientation="right"
-                  stroke="#5f7085"
-                  tick={{ fill: '#8b9bb0', fontSize: 11 }}
-                  width={56}
                 />
                 <Tooltip
                   contentStyle={{
@@ -407,7 +398,6 @@ function App() {
                   iconType="plainline"
                 />
                 <Line
-                  yAxisId="left"
                   type="monotone"
                   dataKey="price"
                   name="Price"
@@ -417,7 +407,6 @@ function App() {
                   isAnimationActive={false}
                 />
                 <Line
-                  yAxisId="left"
                   type="monotone"
                   dataKey="poc"
                   name="POC"
@@ -429,7 +418,6 @@ function App() {
                   isAnimationActive={false}
                 />
                 <Line
-                  yAxisId="left"
                   type="monotone"
                   dataKey="vah"
                   name="VAH"
@@ -441,7 +429,6 @@ function App() {
                   isAnimationActive={false}
                 />
                 <Line
-                  yAxisId="left"
                   type="monotone"
                   dataKey="val"
                   name="VAL"
@@ -450,16 +437,6 @@ function App() {
                   strokeDasharray="2 4"
                   dot={false}
                   connectNulls
-                  isAnimationActive={false}
-                />
-                <Line
-                  yAxisId="right"
-                  type="monotone"
-                  dataKey="pnl"
-                  name="P&L"
-                  stroke="#8b9bb0"
-                  strokeWidth={1.5}
-                  dot={false}
                   isAnimationActive={false}
                 />
               </LineChart>
