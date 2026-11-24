@@ -430,6 +430,50 @@ button:not(:disabled):hover {
   margin-bottom: 18px;
 }
 
+.runner-tp {
+  margin: 0 0 14px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, #5b9cff 35%, var(--border));
+  background: color-mix(in srgb, #5b9cff 8%, var(--bg));
+}
+
+.runner-tp-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+  font-size: 0.82rem;
+  color: var(--text-dim);
+}
+
+.runner-tp-head strong {
+  font-family: var(--mono);
+  font-size: 1rem;
+  color: #5b9cff;
+}
+
+.runner-slider {
+  width: 100%;
+  accent-color: #5b9cff;
+  cursor: grab;
+}
+
+.runner-slider:active {
+  cursor: grabbing;
+}
+
+.runner-tp-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  margin-top: 8px;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  font-family: var(--mono);
+}
+
 .section-title {
   margin: 0 0 14px;
   font-size: 0.95rem;

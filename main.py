@@ -698,8 +698,48 @@ class KTwoLot60Engine:
                 "poc": self.profile.poc / 4.0,
                 "vah": self.profile.vah / 4.0,
                 "val": self.profile.val / 4.0
-            } if self.profile.poc else None
+            } if self.profile.poc else None,
+            "trade_levels": self._trade_levels(),
         }
+
+    def _trade_levels(self) -> Optional[dict]:
+        """Active entry / TP / stop levels for the open position (price units)."""
+        pos = self.position
+        if not pos or pos.direction == 0:
+            return None
+        tp1 = pos.legs[0] if len(pos.legs) > 0 else None
+        opp = pos.legs[1] if len(pos.legs) > 1 else None
+        stop = None
+        if tp1 and tp1.open:
+            stop = tp1.stop / 4.0
+        elif opp and opp.open:
+            stop = opp.stop / 4.0
+        return {
+            "direction": "long" if pos.direction == 1 else "short",
+            "entry": pos.entry_price / 4.0,
+            "tp1": tp1.target / 4.0 if tp1 and tp1.open else None,
+            "tp1_open": bool(tp1 and tp1.open),
+            "runner": opp.target / 4.0 if opp and opp.open else None,
+            "runner_open": bool(opp and opp.open),
+            "stop": stop,
+            "stop_open": stop is not None,
+        }
+
+    def set_runner_target(self, price_ticks: int) -> bool:
+        """Update the open opposite-VA (runner) take-profit target."""
+        pos = self.position
+        if not pos or pos.direction == 0:
+            return False
+        if len(pos.legs) < 2 or not pos.legs[1].open:
+            return False
+        # Keep target on the profit side of entry
+        if pos.direction == 1 and price_ticks <= pos.entry_price:
+            return False
+        if pos.direction == -1 and price_ticks >= pos.entry_price:
+            return False
+        pos.legs[1].target = int(price_ticks)
+        pos.legs[1].kind = "opp"
+        return True
 
 
 # ============================================================================
@@ -901,6 +941,88 @@ class TopstepClient:
             json={"accountId": self.account_id, "orderId": order_id},
         )
         return response.json()
+
+    async def modify_order(
+        self,
+        order_id: int,
+        size: Optional[int] = None,
+        limit_price: Optional[float] = None,
+        stop_price: Optional[float] = None,
+    ) -> dict:
+        """POST /api/Order/modify"""
+        payload = {
+            "accountId": self.account_id,
+            "orderId": order_id,
+            "size": size,
+            "limitPrice": limit_price,
+            "stopPrice": stop_price,
+            "trailPrice": None,
+        }
+        response = await self.client.post(
+            "/api/Order/modify",
+            headers=self._headers(),
+            json=payload,
+        )
+        return response.json()
+
+    async def cancel_open_orders(self, contract_id: Optional[str] = None) -> list[dict]:
+        """Cancel all open orders, optionally filtered to one contract."""
+        cancelled = []
+        for order in await self.search_open_orders():
+            if contract_id and order.get("contractId") != contract_id:
+                continue
+            order_id = order.get("id")
+            if order_id is None:
+                continue
+            result = await self.cancel_order(order_id)
+            cancelled.append({"orderId": order_id, **result})
+        return cancelled
+
+    async def place_exit_brackets(
+        self,
+        contract_id: str,
+        direction: str,
+        legs: list[dict],
+    ) -> dict:
+        """Place TP1 limit (1), runner limit (1), and stop (2) after entry."""
+        if len(legs) < 2:
+            raise RuntimeError("Exit brackets require tp1 and runner legs")
+
+        exit_side = self.SIDE_ASK if direction == "long" else self.SIDE_BID
+        tp1_px = legs[0]["target"] / 4.0
+        opp_px = legs[1]["target"] / 4.0
+        stop_px = legs[0]["stop"] / 4.0
+
+        tp1 = await self.place_order(
+            contract_id=contract_id,
+            side=exit_side,
+            size=1,
+            order_type=self.ORDER_TYPE_LIMIT,
+            limit_price=tp1_px,
+            custom_tag=f"tp1-{uuid.uuid4().hex[:10]}",
+        )
+        opp = await self.place_order(
+            contract_id=contract_id,
+            side=exit_side,
+            size=1,
+            order_type=self.ORDER_TYPE_LIMIT,
+            limit_price=opp_px,
+            custom_tag=f"opp-{uuid.uuid4().hex[:10]}",
+        )
+        stop = await self.place_order(
+            contract_id=contract_id,
+            side=exit_side,
+            size=LOTS,
+            order_type=self.ORDER_TYPE_STOP,
+            stop_price=stop_px,
+            custom_tag=f"stop-{uuid.uuid4().hex[:10]}",
+        )
+        return {
+            "tp1": tp1,
+            "opp": opp,
+            "stop": stop,
+            "prices": {"tp1": tp1_px, "runner": opp_px, "stop": stop_px},
+        }
 
     async def close_contract(self, contract_id: str) -> dict:
         """POST /api/Position/closeContract — flatten one contract."""
@@ -1210,6 +1332,24 @@ class ConnectionManager:
         self._reclaiming_session = False
         self._last_reclaim_attempt = 0.0
         self._last_session_health = 0.0
+        # Working broker exit orders for the open live trade
+        self.working_exits: dict = {
+            "tp1": None,
+            "opp": None,
+            "stop": None,
+        }
+
+    def _clear_working_exits(self):
+        self.working_exits = {"tp1": None, "opp": None, "stop": None}
+
+    @staticmethod
+    def _order_id_from_result(result: Optional[dict]) -> Optional[int]:
+        if not result or not result.get("success"):
+            return None
+        oid = result.get("orderId")
+        if oid is None:
+            oid = (result.get("order") or {}).get("id")
+        return int(oid) if oid is not None else None
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -1312,7 +1452,120 @@ class ConnectionManager:
         status = self.engine.get_status()
         status["broker"] = dict(self.broker_snapshot)
         status["topstep_session"] = dict(self.topstep_session)
+        status["working_exits"] = {
+            "tp1": self.working_exits.get("tp1"),
+            "opp": self.working_exits.get("opp"),
+            "stop": self.working_exits.get("stop"),
+        }
         return status
+
+    async def cancel_working_and_open_orders(self, reason: str = "cleanup") -> list[dict]:
+        """Cancel tracked exit orders and any other open orders on the contract."""
+        if not self.topstep:
+            return []
+        cancelled = []
+        try:
+            cancelled = await self.topstep.cancel_open_orders(self.contract_id)
+        except Exception as e:
+            if self.diag:
+                self.diag.info("cancel_orders_error", error=str(e), reason=reason)
+        self._clear_working_exits()
+        if self.diag:
+            self.diag.info(
+                "cancel_orders",
+                reason=reason,
+                count=len(cancelled),
+            )
+        return cancelled
+
+    async def place_live_exit_brackets(self, enter_action: dict) -> Optional[dict]:
+        """After a filled entry, rest TP1 + runner limits and a 2-lot stop."""
+        if not self.topstep or not self.contract_id:
+            return None
+        if not TOPSTEP_ENABLE_ORDERS:
+            return {"skipped": True, "reason": "TOPSTEP_ENABLE_ORDERS=false"}
+
+        brackets = await self.topstep.place_exit_brackets(
+            contract_id=self.contract_id,
+            direction=enter_action.get("direction") or "long",
+            legs=enter_action.get("legs") or [],
+        )
+        self.working_exits = {
+            "tp1": self._order_id_from_result(brackets.get("tp1")),
+            "opp": self._order_id_from_result(brackets.get("opp")),
+            "stop": self._order_id_from_result(brackets.get("stop")),
+        }
+        if self.diag:
+            self.diag.info(
+                "exit_brackets",
+                tp1=self.working_exits["tp1"],
+                opp=self.working_exits["opp"],
+                stop=self.working_exits["stop"],
+                prices=brackets.get("prices"),
+            )
+        await self.broadcast({"type": "broker", "data": {"action": "brackets", **brackets}})
+        return brackets
+
+    async def on_tp1_filled_broker(self):
+        """After TP1, shrink the stop to 1 lot and drop the TP1 order id."""
+        self.working_exits["tp1"] = None
+        stop_id = self.working_exits.get("stop")
+        if not stop_id or not self.topstep or not TOPSTEP_ENABLE_ORDERS:
+            return
+        try:
+            result = await self.topstep.modify_order(stop_id, size=1)
+            if self.diag:
+                self.diag.info(
+                    "stop_resize",
+                    orderId=stop_id,
+                    size=1,
+                    success=result.get("success"),
+                    errorCode=result.get("errorCode"),
+                )
+            await self.broadcast({
+                "type": "broker",
+                "data": {"action": "stop_resize", "broker": result, "size": 1},
+            })
+        except Exception as e:
+            if self.diag:
+                self.diag.info("stop_resize_error", error=str(e))
+
+    async def update_runner_tp(self, price: float) -> dict:
+        """Move the runner take-profit (engine + resting limit order)."""
+        if not self.engine:
+            return {"success": False, "error": "No engine"}
+        # Snap to MNQ tick (0.25)
+        price = round(float(price) * 4.0) / 4.0
+        ok = self.engine.set_runner_target(price_to_ticks(price))
+        if not ok:
+            return {"success": False, "error": "Runner target not adjustable"}
+
+        broker = None
+        opp_id = self.working_exits.get("opp")
+        if (
+            self.mode == "live"
+            and self.topstep
+            and opp_id
+            and TOPSTEP_ENABLE_ORDERS
+        ):
+            broker = await self.topstep.modify_order(opp_id, limit_price=price)
+            if self.diag:
+                self.diag.info(
+                    "runner_modify",
+                    orderId=opp_id,
+                    limitPrice=price,
+                    success=broker.get("success"),
+                    errorCode=broker.get("errorCode"),
+                )
+
+        status = self._engine_status_with_broker()
+        await self.broadcast({
+            "type": "runner_update",
+            "price": price,
+            "status": status,
+            "broker": broker,
+        })
+        return {"success": True, "price": price, "status": status, "broker": broker}
 
     def _set_topstep_session(self, state: str, message: str = None, reason: str = None):
         self.topstep_session = {
@@ -1515,6 +1768,11 @@ class ConnectionManager:
             reconciled = self.engine._close_all("external_flat", mark, ts)
             note = "engine_flattened_external"
             desync = True
+            # Drop any resting TP/stop orders left behind
+            try:
+                await self.cancel_working_and_open_orders(reason="external_flat")
+            except Exception:
+                pass
         elif self.engine and engine_legs > 0 and abs_size > 0:
             same_side = (engine_signed > 0 and signed > 0) or (
                 engine_signed < 0 and signed < 0
@@ -1523,11 +1781,15 @@ class ConnectionManager:
                 note = "broker_opposite_side"
                 desync = True
             elif abs_size < engine_legs:
+                trimmed = engine_legs - abs_size
                 reconciled = self.engine._close_n_legs(
-                    engine_legs - abs_size, "external_partial", mark, ts
+                    trimmed, "external_partial", mark, ts
                 )
                 note = "engine_trimmed_to_broker"
                 desync = True
+                # Likely TP1 fill at broker — resize stop to remaining size
+                if abs_size == 1:
+                    await self.on_tp1_filled_broker()
             elif abs_size > engine_legs:
                 note = "broker_larger_than_engine"
                 desync = True
@@ -1607,13 +1869,13 @@ class ConnectionManager:
             result["engine"] = {
                 "success": True,
                 "actions": actions,
-                "status": self.engine.get_status(),
+                "status": self._engine_status_with_broker(),
             }
             await self.broadcast({
                 "type": "tick",
                 "price": fill_price / 4.0,
                 "timestamp": ts.isoformat(),
-                "status": self.engine.get_status(),
+                "status": self._engine_status_with_broker(),
             })
 
         # Broker flatten only in live mode (replay/test stay local-engine only).
@@ -1621,6 +1883,7 @@ class ConnectionManager:
             try:
                 client = await self.ensure_topstep()
                 result["broker"] = await client.close_all_positions()
+                self._clear_working_exits()
             except Exception as e:
                 result["broker"] = {"success": False, "error": str(e)}
 
@@ -1637,6 +1900,8 @@ class ConnectionManager:
         )
         engine_ok = result["engine"] is None or result["engine"].get("success", False)
         result["success"] = broker_ok and engine_ok
+        if result.get("engine") and self.engine:
+            result["engine"]["status"] = self._engine_status_with_broker()
         return result
 
     async def _market_data_loop(
@@ -1827,6 +2092,16 @@ class ConnectionManager:
             })
         self.running = False
 
+    async def _broker_signed_for_contract(self) -> int:
+        if not self.topstep or not self.contract_id:
+            return 0
+        positions = await self.topstep.search_open_positions()
+        match = next(
+            (p for p in positions if p.get("contractId") == self.contract_id),
+            None,
+        )
+        return _broker_signed_size(match)
+
     async def _execute_live_actions(self, actions: list[dict]):
         """Broadcast engine actions and optionally place broker orders."""
         for action in actions:
@@ -1842,9 +2117,12 @@ class ConnectionManager:
 
         enters = [a for a in actions if a.get("action") == "enter"]
         exits = [a for a in actions if a.get("action") == "exit"]
+        fully_flat = any(a.get("action") == "trade_summary" for a in actions)
 
         try:
             for action in enters:
+                # Clear any leftover working orders before a new entry
+                await self.cancel_working_and_open_orders(reason="pre_enter")
                 result = await self.topstep.execute_strategy_action(
                     action,
                     contract_id=self.contract_id,
@@ -1854,26 +2132,46 @@ class ConnectionManager:
                     await self.broadcast({"type": "broker", "data": result})
                     if self.diag:
                         self.diag.info("broker", **_flatten_broker_log(result))
+                    broker = result.get("broker") or {}
+                    if broker.get("success") is not False and not result.get("skipped"):
+                        try:
+                            await self.place_live_exit_brackets(action)
+                        except Exception as bracket_err:
+                            if self.diag:
+                                self.diag.info(
+                                    "exit_brackets_error", error=str(bracket_err)
+                                )
+                            await self.broadcast({
+                                "type": "status",
+                                "message": f"Exit brackets failed: {bracket_err}",
+                            })
 
             if exits:
                 flatten = any(
-                    a.get("reason") in ("session_close", "manual_close")
+                    a.get("reason") in (
+                        "session_close",
+                        "manual_close",
+                        "external_flat",
+                    )
                     for a in exits
                 )
-                if flatten:
-                    result = await self.topstep.execute_strategy_action(
-                        {"action": "exit", "reason": "session_close"},
-                        contract_id=self.contract_id,
-                        enable_orders=TOPSTEP_ENABLE_ORDERS,
-                    )
-                    if result:
-                        await self.broadcast({"type": "broker", "data": result})
-                        if self.diag:
-                            self.diag.info("broker", **_flatten_broker_log(result))
-                else:
-                    for action in exits:
+                stop_exit = any(a.get("reason") == "stop" for a in exits)
+                tp1_exits = [
+                    a for a in exits
+                    if a.get("kind") == "tp1" or a.get("leg") == 0
+                ]
+                runner_exits = [
+                    a for a in exits
+                    if a.get("kind") == "opp" or a.get("leg") == 1
+                ]
+
+                if flatten or stop_exit or fully_flat or runner_exits:
+                    # Done with the trade (or protecting) — cancel resting exits
+                    await self.cancel_working_and_open_orders(reason="exit_flatten")
+                    signed = await self._broker_signed_for_contract()
+                    if signed != 0:
                         result = await self.topstep.execute_strategy_action(
-                            action,
+                            {"action": "exit", "reason": "session_close"},
                             contract_id=self.contract_id,
                             enable_orders=TOPSTEP_ENABLE_ORDERS,
                         )
@@ -1881,20 +2179,44 @@ class ConnectionManager:
                             await self.broadcast({"type": "broker", "data": result})
                             if self.diag:
                                 self.diag.info("broker", **_flatten_broker_log(result))
-                            broker = result.get("broker") or {}
-                            if broker.get("success") is False:
-                                # Likely already flat via Topstep rule / race —
-                                # pull truth from broker and reconcile engine.
-                                try:
+                    # Cancel again in case close left orphans
+                    await self.cancel_working_and_open_orders(reason="post_flatten")
+                else:
+                    # TP1 only — leave runner limit; shrink stop to 1
+                    for action in tp1_exits:
+                        # Cancel the TP1 resting order if still open
+                        tp1_id = self.working_exits.get("tp1")
+                        if tp1_id and TOPSTEP_ENABLE_ORDERS:
+                            try:
+                                await self.topstep.cancel_order(tp1_id)
+                            except Exception:
+                                pass
+                            self.working_exits["tp1"] = None
+
+                        signed = await self._broker_signed_for_contract()
+                        if abs(signed) >= 2:
+                            # Limit may not have filled yet — market out 1 lot
+                            result = await self.topstep.execute_strategy_action(
+                                action,
+                                contract_id=self.contract_id,
+                                enable_orders=TOPSTEP_ENABLE_ORDERS,
+                            )
+                            if result:
+                                await self.broadcast({"type": "broker", "data": result})
+                                if self.diag:
+                                    self.diag.info(
+                                        "broker", **_flatten_broker_log(result)
+                                    )
+                                broker = result.get("broker") or {}
+                                if broker.get("success") is False:
                                     await self.sync_broker_position(
                                         reason="after_failed_exit"
                                     )
-                                except Exception as sync_err:
-                                    if self.diag:
-                                        self.diag.info(
-                                            "broker_sync_error",
-                                            error=str(sync_err),
-                                        )
+                        await self.on_tp1_filled_broker()
+
+                if fully_flat:
+                    await self.cancel_working_and_open_orders(reason="trade_done")
+
         except Exception as e:
             if self.diag:
                 self.diag.info("broker_error", error=str(e))
@@ -2337,6 +2659,28 @@ async def websocket_endpoint(websocket: WebSocket):
                         "message": f"Broker sync failed: {e}",
                     })
 
+            elif cmd == "update_runner":
+                try:
+                    price = float(data.get("price"))
+                    result = await manager.update_runner_tp(price)
+                    await websocket.send_json({
+                        "type": "runner_update",
+                        "price": result.get("price"),
+                        "status": result.get("status"),
+                        "broker": result.get("broker"),
+                        "message": (
+                            f"Runner TP → {result.get('price'):.2f}"
+                            if result.get("success")
+                            else result.get("error") or "Runner update failed"
+                        ),
+                        "success": result.get("success"),
+                    })
+                except Exception as e:
+                    await websocket.send_json({
+                        "type": "status",
+                        "message": f"Runner update failed: {e}",
+                    })
+
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
@@ -2388,6 +2732,16 @@ async def close_all_positions():
     """Flatten all open positions (engine + broker)."""
     try:
         return await manager.close_all_positions()
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/trade/runner-tp")
+async def update_runner_tp(payload: dict):
+    """Update runner take-profit price: {\"price\": 26350.25}."""
+    try:
+        price = float(payload.get("price"))
+        return await manager.update_runner_tp(price)
     except Exception as e:
         return {"success": False, "error": str(e)}
 

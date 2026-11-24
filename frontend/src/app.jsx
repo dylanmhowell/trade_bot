@@ -8,6 +8,7 @@ import {
   Tooltip,
   ResponsiveContainer,
   Legend,
+  ReferenceLine,
 } from 'recharts';
 import { playTradeAction, playSessionLost } from './sounds.js';
 
@@ -168,6 +169,14 @@ function App() {
             msg.status?.broker?.desync ||
             String(msg.message).toLowerCase().includes('fail');
           showToast(msg.message, bad);
+        }
+        break;
+      case 'runner_update':
+        if (msg.status) {
+          setStatus(msg.status);
+        }
+        if (msg.message) {
+          showToast(msg.message, msg.success === false);
         }
         break;
       case 'broker': {
@@ -525,6 +534,29 @@ function App() {
 
       <section className="panel chart-panel">
         <h3 className="section-title">Price (Eastern)</h3>
+        {status?.trade_levels?.runner_open && (
+          <RunnerTpControl
+            levels={status.trade_levels}
+            lastPrice={status.last_price}
+            onCommit={(price) => {
+              fetch('/api/trade/runner-tp', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ price }),
+              })
+                .then((r) => r.json())
+                .then((data) => {
+                  if (data?.status) setStatus(data.status);
+                  if (!data?.success) {
+                    showToast(data.error || 'Runner update failed', true);
+                  }
+                })
+                .catch(() => {
+                  send({ command: 'update_runner', price });
+                });
+            }}
+          />
+        )}
         <div className="chart-wrap">
           {ticks.length === 0 ? (
             <div className="empty">
@@ -533,77 +565,7 @@ function App() {
                 : 'Start the strategy to stream ticks.'}
             </div>
           ) : (
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={ticks}>
-                <CartesianGrid stroke="rgba(255,255,255,0.06)" strokeDasharray="3 3" />
-                <XAxis
-                  dataKey="time"
-                  stroke="#5f7085"
-                  tick={{ fill: '#8b9bb0', fontSize: 11 }}
-                  minTickGap={24}
-                />
-                <YAxis
-                  domain={['auto', 'auto']}
-                  stroke="#5f7085"
-                  tick={{ fill: '#8b9bb0', fontSize: 11 }}
-                  width={64}
-                />
-                <Tooltip
-                  contentStyle={{
-                    background: '#121820',
-                    border: '1px solid rgba(255,255,255,0.1)',
-                    borderRadius: 10,
-                    color: '#e8eef6',
-                  }}
-                />
-                <Legend
-                  wrapperStyle={{ color: '#8b9bb0', fontSize: 12 }}
-                  iconType="plainline"
-                />
-                <Line
-                  type="monotone"
-                  dataKey="price"
-                  name="Price"
-                  stroke="#5b9cff"
-                  strokeWidth={2}
-                  dot={false}
-                  isAnimationActive={false}
-                />
-                <Line
-                  type="monotone"
-                  dataKey="poc"
-                  name="POC"
-                  stroke="#f0b429"
-                  strokeWidth={1.5}
-                  strokeDasharray="4 3"
-                  dot={false}
-                  connectNulls
-                  isAnimationActive={false}
-                />
-                <Line
-                  type="monotone"
-                  dataKey="vah"
-                  name="VAH"
-                  stroke="#3dd68c"
-                  strokeWidth={1.5}
-                  strokeDasharray="2 4"
-                  dot={false}
-                  connectNulls
-                  isAnimationActive={false}
-                />
-                <Line
-                  type="monotone"
-                  dataKey="val"
-                  name="VAL"
-                  stroke="#ff6b7a"
-                  strokeWidth={1.5}
-                  strokeDasharray="2 4"
-                  dot={false}
-                  connectNulls
-                  isAnimationActive={false}
-                />
-              </LineChart>
-            </ResponsiveContainer>
+            <PriceChart ticks={ticks} levels={status?.trade_levels} />
           )}
         </div>
       </section>
@@ -666,6 +628,204 @@ function StatusCard({ title, value, color = 'var(--text)' }) {
       <div className="stat-label">{title}</div>
       <div className="stat-value" style={{ color }}>
         {value}
+      </div>
+    </div>
+  );
+}
+
+function snapTick(price) {
+  return Math.round(Number(price) * 4) / 4;
+}
+
+function PriceChart({ ticks, levels }) {
+  const domain = chartDomain(ticks, levels);
+  return (
+    <ResponsiveContainer width="100%" height="100%">
+      <LineChart data={ticks} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+        <CartesianGrid stroke="rgba(255,255,255,0.06)" strokeDasharray="3 3" />
+        <XAxis
+          dataKey="time"
+          stroke="#5f7085"
+          tick={{ fill: '#8b9bb0', fontSize: 11 }}
+          minTickGap={24}
+        />
+        <YAxis
+          domain={domain}
+          stroke="#5f7085"
+          tick={{ fill: '#8b9bb0', fontSize: 11 }}
+          width={64}
+          tickFormatter={(v) => Number(v).toFixed(0)}
+        />
+        <Tooltip
+          contentStyle={{
+            background: '#121820',
+            border: '1px solid rgba(255,255,255,0.1)',
+            borderRadius: 10,
+            color: '#e8eef6',
+          }}
+        />
+        <Legend
+          wrapperStyle={{ color: '#8b9bb0', fontSize: 12 }}
+          iconType="plainline"
+        />
+        <Line
+          type="monotone"
+          dataKey="price"
+          name="Price"
+          stroke="#5b9cff"
+          strokeWidth={2}
+          dot={false}
+          isAnimationActive={false}
+        />
+        <Line
+          type="monotone"
+          dataKey="poc"
+          name="POC"
+          stroke="#f0b429"
+          strokeWidth={1.5}
+          strokeDasharray="4 3"
+          dot={false}
+          connectNulls
+          isAnimationActive={false}
+        />
+        <Line
+          type="monotone"
+          dataKey="vah"
+          name="VAH"
+          stroke="#3dd68c"
+          strokeWidth={1.5}
+          strokeDasharray="2 4"
+          dot={false}
+          connectNulls
+          isAnimationActive={false}
+        />
+        <Line
+          type="monotone"
+          dataKey="val"
+          name="VAL"
+          stroke="#ff6b7a"
+          strokeWidth={1.5}
+          strokeDasharray="2 4"
+          dot={false}
+          connectNulls
+          isAnimationActive={false}
+        />
+        {levels?.entry != null && (
+          <ReferenceLine
+            y={levels.entry}
+            stroke="#8b9bb0"
+            strokeDasharray="3 3"
+            label={{ value: 'Entry', fill: '#8b9bb0', fontSize: 11 }}
+          />
+        )}
+        {levels?.tp1 != null && levels.tp1_open && (
+          <ReferenceLine
+            y={levels.tp1}
+            stroke="#3dd68c"
+            strokeWidth={1.5}
+            label={{ value: 'TP1', fill: '#3dd68c', fontSize: 11 }}
+          />
+        )}
+        {levels?.runner != null && levels.runner_open && (
+          <ReferenceLine
+            y={levels.runner}
+            stroke="#5b9cff"
+            strokeWidth={2}
+            label={{ value: 'Runner TP', fill: '#5b9cff', fontSize: 11 }}
+          />
+        )}
+        {levels?.stop != null && levels.stop_open && (
+          <ReferenceLine
+            y={levels.stop}
+            stroke="#ff6b7a"
+            strokeWidth={1.5}
+            label={{ value: 'Stop', fill: '#ff6b7a', fontSize: 11 }}
+          />
+        )}
+      </LineChart>
+    </ResponsiveContainer>
+  );
+}
+
+function chartDomain(ticks, levels) {
+  const vals = [];
+  for (const t of ticks || []) {
+    if (t.price != null) vals.push(t.price);
+    if (t.poc != null) vals.push(t.poc);
+    if (t.vah != null) vals.push(t.vah);
+    if (t.val != null) vals.push(t.val);
+  }
+  if (levels) {
+    for (const key of ['entry', 'tp1', 'runner', 'stop']) {
+      if (levels[key] != null) vals.push(levels[key]);
+    }
+  }
+  if (!vals.length) return ['auto', 'auto'];
+  const lo = Math.min(...vals);
+  const hi = Math.max(...vals);
+  const pad = Math.max((hi - lo) * 0.08, 4);
+  return [lo - pad, hi + pad];
+}
+
+function RunnerTpControl({ levels, lastPrice, onCommit }) {
+  const [draft, setDraft] = useState(levels.runner);
+  const dragging = useRef(false);
+
+  useEffect(() => {
+    if (!dragging.current && levels.runner != null) {
+      setDraft(levels.runner);
+    }
+  }, [levels.runner]);
+
+  const entry = levels.entry;
+  const isLong = levels.direction === 'long';
+  // Allow runner from just beyond entry out to a wide favorable band
+  const min = isLong ? entry + 0.25 : (lastPrice != null ? Math.min(lastPrice, entry) - 80 : entry - 80);
+  const max = isLong
+    ? (lastPrice != null ? Math.max(lastPrice, entry) + 80 : entry + 80)
+    : entry - 0.25;
+
+  const commit = (raw) => {
+    const price = snapTick(raw);
+    setDraft(price);
+    onCommit(price);
+  };
+
+  return (
+    <div className="runner-tp">
+      <div className="runner-tp-head">
+        <span>Runner TP (drag to amend limit)</span>
+        <strong>{Number(draft).toFixed(2)}</strong>
+      </div>
+      <input
+        type="range"
+        className="runner-slider"
+        min={Math.min(min, max)}
+        max={Math.max(min, max)}
+        step={0.25}
+        value={draft}
+        onMouseDown={() => {
+          dragging.current = true;
+        }}
+        onTouchStart={() => {
+          dragging.current = true;
+        }}
+        onChange={(e) => setDraft(Number(e.target.value))}
+        onMouseUp={(e) => {
+          dragging.current = false;
+          commit(e.target.value);
+        }}
+        onTouchEnd={(e) => {
+          dragging.current = false;
+          commit(e.target.value);
+        }}
+      />
+      <div className="runner-tp-meta">
+        <span>Entry {entry?.toFixed(2)}</span>
+        {levels.tp1_open && levels.tp1 != null && (
+          <span>TP1 {levels.tp1.toFixed(2)}</span>
+        )}
+        {levels.stop != null && <span>Stop {levels.stop.toFixed(2)}</span>}
       </div>
     </div>
   );
