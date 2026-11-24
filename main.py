@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from zoneinfo import ZoneInfo
 
 from backtest_va import from_100ns, rth_profile_for_session
+from live_log import LiveDiagLog
 from topstep_live import (
     DevelopingValueArea,
     TopstepMarketHub,
@@ -131,19 +132,20 @@ class TradeSummary:
 
 class KTwoLot60Engine:
     """Real-time strategy engine for K_two_lot_60."""
-    
-    def __init__(self):
+
+    def __init__(self, diag: Optional[LiveDiagLog] = None):
         self.state = State.FLAT
         self.profile = Profile()
         self.position: Optional[Position] = None
         self.origin = 0           # 1 = above POC, -1 = below POC
         self.prev_price: Optional[int] = None
-        
+        self.diag = diag
+
         # Session state
         self.session_date: Optional[str] = None
         self.entry_window_open = False
         self.rth_active = False
-        
+
         # Statistics
         self.daily_trades: list[TradeSummary] = []
         self.total_commission_cents = 0
@@ -152,6 +154,9 @@ class KTwoLot60Engine:
         self.max_drawdown_cents = 0
         # Live mode clears this until today's VA has been seeded from history
         self.entries_enabled = True
+
+    def _px(self, ticks: Optional[int]) -> Optional[float]:
+        return None if ticks is None else ticks / 4.0
 
     def update_profile(self, poc: int, vah: int, val: int, ts: datetime):
         """Update value area profile from external source."""
@@ -173,7 +178,7 @@ class KTwoLot60Engine:
             return actions
 
         # Update crossing state
-        self._update_crossing_state(price)
+        self._update_crossing_state(price, ts)
 
         # Check for exits first
         if self.position and self.position.direction != 0:
@@ -187,14 +192,18 @@ class KTwoLot60Engine:
 
         # Check for entry (must already be armed from a POC cross)
         if (
-            self.entries_enabled
-            and self.state in (State.ARMED_SHORT, State.ARMED_LONG)
-            and self.entry_window_open
+            self.state in (State.ARMED_SHORT, State.ARMED_LONG)
             and not self.position
         ):
-            entry_action = self._check_entry(price, ts)
-            if entry_action:
-                actions.append(entry_action)
+            if not self.entries_enabled:
+                # Only note when a trigger cross actually happens
+                self._check_entry(price, ts, log_only_block="entries_disabled")
+            elif not self.entry_window_open:
+                self._check_entry(price, ts, log_only_block="outside_entry_window")
+            else:
+                entry_action = self._check_entry(price, ts)
+                if entry_action:
+                    actions.append(entry_action)
 
         self.prev_price = price
         self._mark_equity(self._unrealized_cents())
@@ -217,6 +226,12 @@ class KTwoLot60Engine:
 
         entry_start = clock(ENTRY_HOUR, ENTRY_MINUTE)
         self.entry_window_open = entry_start <= t < ENTRY_END
+        if self.diag:
+            self.diag.entry_window(
+                self.entry_window_open,
+                ts=ts,
+                time_et=t.isoformat(timespec="seconds"),
+            )
 
     def _unrealized_cents(self) -> int:
         if not self.position or self.prev_price is None:
@@ -236,11 +251,13 @@ class KTwoLot60Engine:
         drawdown = self.equity_peak_cents - equity
         if drawdown > self.max_drawdown_cents:
             self.max_drawdown_cents = drawdown
-    
-    def _update_crossing_state(self, price: int):
+
+    def _update_crossing_state(self, price: int, ts: Optional[datetime] = None):
         """Update POC crossing armed state."""
         if self.profile.poc == 0:
             return
+
+        prev_state = self.state
 
         # Never overwrite an open position's state with arming flags
         if self.state != State.IN_POSITION:
@@ -256,7 +273,23 @@ class KTwoLot60Engine:
         else:
             self.origin = 0
 
-    def _check_entry(self, price: int, ts: datetime) -> Optional[dict]:
+        if self.diag and self.state != prev_state:
+            self.diag.state_change(
+                self.state.value,
+                ts=ts,
+                price=self._px(price),
+                poc=self._px(self.profile.poc),
+                vah=self._px(self.profile.vah),
+                val=self._px(self.profile.val),
+                origin=self.origin,
+            )
+
+    def _check_entry(
+        self,
+        price: int,
+        ts: datetime,
+        log_only_block: Optional[str] = None,
+    ) -> Optional[dict]:
         """Check if entry conditions met."""
         if self.profile.vah == 0 or self.profile.val == 0:
             return None
@@ -265,19 +298,67 @@ class KTwoLot60Engine:
             trigger = self.profile.vah
             # Must be below VAH and cross up through it
             if self.prev_price and self.prev_price < trigger and price >= trigger:
-                if abs(self.profile.poc - trigger) >= MIN_POC_DIST:
-                    return self._enter_position(-1, price, ts, trigger)
+                dist = abs(self.profile.poc - trigger)
+                if dist < MIN_POC_DIST:
+                    if self.diag:
+                        self.diag.near_miss(
+                            "poc_distance",
+                            ts=ts,
+                            side="short",
+                            price=self._px(price),
+                            trigger=self._px(trigger),
+                            poc=self._px(self.profile.poc),
+                            dist_pts=dist / 4.0,
+                            min_pts=MIN_POC_DIST / 4.0,
+                        )
+                    return None
+                if log_only_block:
+                    if self.diag:
+                        self.diag.near_miss(
+                            log_only_block,
+                            ts=ts,
+                            side="short",
+                            price=self._px(price),
+                            trigger=self._px(trigger),
+                            poc=self._px(self.profile.poc),
+                        )
+                    return None
+                return self._enter_position(-1, price, ts, trigger)
 
         elif self.state == State.ARMED_LONG:
             trigger = self.profile.val
             # Must be above VAL and cross down through it
             if self.prev_price and self.prev_price > trigger and price <= trigger:
-                if abs(self.profile.poc - trigger) >= MIN_POC_DIST:
-                    return self._enter_position(1, price, ts, trigger)
+                dist = abs(self.profile.poc - trigger)
+                if dist < MIN_POC_DIST:
+                    if self.diag:
+                        self.diag.near_miss(
+                            "poc_distance",
+                            ts=ts,
+                            side="long",
+                            price=self._px(price),
+                            trigger=self._px(trigger),
+                            poc=self._px(self.profile.poc),
+                            dist_pts=dist / 4.0,
+                            min_pts=MIN_POC_DIST / 4.0,
+                        )
+                    return None
+                if log_only_block:
+                    if self.diag:
+                        self.diag.near_miss(
+                            log_only_block,
+                            ts=ts,
+                            side="long",
+                            price=self._px(price),
+                            trigger=self._px(trigger),
+                            poc=self._px(self.profile.poc),
+                        )
+                    return None
+                return self._enter_position(1, price, ts, trigger)
 
         return None
-    
-    def _enter_position(self, direction: int, price: int, ts: datetime, 
+
+    def _enter_position(self, direction: int, price: int, ts: datetime,
                        trigger_price: int) -> dict:
         """Create entry action and initialize position."""
         self.position = Position(
@@ -286,25 +367,46 @@ class KTwoLot60Engine:
             entry_time=ts
         )
         self.state = State.IN_POSITION
-        
+
         # Calculate targets and stops
         stop = price - direction * STOP_TICKS
-        
+
         # Leg 1: TP1 at 20 points
         self.position.legs[0].open = True
         self.position.legs[0].target = price + direction * TP1_TICKS
         self.position.legs[0].stop = stop
         self.position.legs[0].kind = "tp1"
-        
+
         # Leg 2: Opposite VA edge (or stop out)
         opp_target = self.profile.val if direction == -1 else self.profile.vah
         self.position.legs[1].open = True
         self.position.legs[1].target = opp_target
         self.position.legs[1].stop = stop
         self.position.legs[1].kind = "opp"
-        
+
         self.total_commission_cents += LOTS * COMMISSION_CENTS
-        
+
+        if self.diag:
+            self.diag.info(
+                "entry",
+                ts=ts,
+                direction="short" if direction == -1 else "long",
+                price=self._px(price),
+                trigger=self._px(trigger_price),
+                stop=self._px(stop),
+                tp1=self._px(self.position.legs[0].target),
+                opp=self._px(opp_target),
+                poc=self._px(self.profile.poc),
+                vah=self._px(self.profile.vah),
+                val=self._px(self.profile.val),
+                qty=LOTS,
+            )
+            self.diag.state_change(
+                self.state.value,
+                ts=ts,
+                price=self._px(price),
+            )
+
         return {
             "action": "enter",
             "direction": "short" if direction == -1 else "long",
@@ -353,8 +455,18 @@ class KTwoLot60Engine:
                     "reason": "stop",
                     "timestamp": ts.isoformat()
                 })
+                if self.diag:
+                    self.diag.info(
+                        "exit",
+                        ts=ts,
+                        reason="stop",
+                        leg=i,
+                        kind=leg.kind,
+                        fill=self._px(fill),
+                        entry=self._px(pos.entry_price),
+                    )
                 continue
-            
+
             # Check target
             target_hit = False
             if pos.direction == 1 and price >= leg.target:
@@ -363,7 +475,7 @@ class KTwoLot60Engine:
             elif pos.direction == -1 and price <= leg.target:
                 target_hit = True
                 fill = leg.target
-            
+
             if target_hit:
                 leg.open = False
                 leg.filled_price = fill
@@ -378,26 +490,38 @@ class KTwoLot60Engine:
                     "reason": "target",
                     "timestamp": ts.isoformat()
                 })
+                if self.diag:
+                    self.diag.info(
+                        "exit",
+                        ts=ts,
+                        reason="target",
+                        leg=i,
+                        kind=leg.kind,
+                        fill=self._px(fill),
+                        entry=self._px(pos.entry_price),
+                    )
                 continue
-            
+
             all_closed = False
-        
+
         if all_closed:
             actions.extend(self._record_trade(ts))
             self.position = None
             self.state = State.FLAT
-        
+            if self.diag:
+                self.diag.state_change(self.state.value, ts=ts)
+
         return actions
-    
+
     def _close_all(self, reason: str, price: int, ts: datetime) -> list[dict]:
         """Force close all legs at market."""
         actions = []
         pos = self.position
         if not pos:
             return actions
-        
+
         fill = price - STOP_SLIP_TICKS if pos.direction == 1 else price + STOP_SLIP_TICKS
-        
+
         for i, leg in enumerate(pos.legs):
             if leg.open:
                 leg.open = False
@@ -413,10 +537,22 @@ class KTwoLot60Engine:
                     "reason": reason,
                     "timestamp": ts.isoformat()
                 })
-        
+                if self.diag:
+                    self.diag.info(
+                        "exit",
+                        ts=ts,
+                        reason=reason,
+                        leg=i,
+                        kind=leg.kind,
+                        fill=self._px(fill),
+                        entry=self._px(pos.entry_price),
+                    )
+
         actions.extend(self._record_trade(ts))
         self.position = None
         self.state = State.FLAT
+        if self.diag:
+            self.diag.state_change(self.state.value, ts=ts)
         return actions
     
     def _record_trade(self, ts: datetime) -> list[dict]:
@@ -849,6 +985,21 @@ class TopstepClient:
 # Connection Manager
 # ============================================================================
 
+def _flatten_broker_log(result: dict) -> dict:
+    """Flatten nested broker payloads for one-line log fields."""
+    broker = result.get("broker") or {}
+    return {
+        "action": result.get("action"),
+        "mode": result.get("mode"),
+        "skipped": result.get("skipped"),
+        "reason": result.get("reason"),
+        "success": broker.get("success", result.get("success")),
+        "orderId": broker.get("orderId"),
+        "errorCode": broker.get("errorCode"),
+        "errorMessage": broker.get("errorMessage"),
+    }
+
+
 def list_sessions(sessions_dir: Path = SESSIONS_DIR) -> list[dict]:
     """Load session metadata from manifest.json."""
     manifest_path = sessions_dir / "manifest.json"
@@ -901,6 +1052,7 @@ class ConnectionManager:
         self.market_hub: Optional[TopstepMarketHub] = None
         self.value_area = DevelopingValueArea()
         self._live_queue: Optional[asyncio.Queue] = None
+        self.diag: Optional[LiveDiagLog] = None
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -940,10 +1092,22 @@ class ConnectionManager:
         self.stop()
         await asyncio.sleep(0)  # let prior loop observe running=False
 
-        self.engine = KTwoLot60Engine()
+        self.diag = LiveDiagLog() if mode == "live" else None
+        log_path = None
+        if self.diag:
+            log_path = self.diag.open_day()
+            self.diag.info("mode", mode=mode)
+
+        self.engine = KTwoLot60Engine(diag=self.diag)
         self.running = True
         self.mode = mode
         self.test_mode = mode != "live"
+        if self.diag and log_path:
+            self.diag.info("engine_start", log_file=str(log_path))
+            await self.broadcast({
+                "type": "status",
+                "message": f"Live diag log: {log_path}",
+            })
 
         if mode == "live":
             if not TOPSTEP_USERNAME or not TOPSTEP_API_KEY:
@@ -1248,6 +1412,8 @@ class ConnectionManager:
                 )
                 if result:
                     await self.broadcast({"type": "broker", "data": result})
+                    if self.diag:
+                        self.diag.info("broker", **_flatten_broker_log(result))
 
             if exits:
                 flatten = any(
@@ -1262,6 +1428,8 @@ class ConnectionManager:
                     )
                     if result:
                         await self.broadcast({"type": "broker", "data": result})
+                        if self.diag:
+                            self.diag.info("broker", **_flatten_broker_log(result))
                 else:
                     for action in exits:
                         result = await self.topstep.execute_strategy_action(
@@ -1271,7 +1439,11 @@ class ConnectionManager:
                         )
                         if result:
                             await self.broadcast({"type": "broker", "data": result})
+                            if self.diag:
+                                self.diag.info("broker", **_flatten_broker_log(result))
         except Exception as e:
+            if self.diag:
+                self.diag.info("broker_error", error=str(e))
             await self.broadcast({
                 "type": "status",
                 "message": f"Broker action error: {e}",
@@ -1463,6 +1635,14 @@ class ConnectionManager:
                 f"orders={'ON' if TOPSTEP_ENABLE_ORDERS else 'OFF'}"
             ),
         })
+        if self.diag:
+            self.diag.info(
+                "live_contract",
+                name=contract.get("name"),
+                contract=self.contract_id,
+                account=self.topstep.account_id,
+                orders=TOPSTEP_ENABLE_ORDERS,
+            )
 
         # Rebuild today's VA before connecting the trade stream / allowing entries
         try:
@@ -1471,6 +1651,17 @@ class ConnectionManager:
                 "type": "status",
                 "message": seed.get("message") or "VA seed finished",
             })
+            if self.diag:
+                self.diag.info(
+                    "va_seed",
+                    seeded=seed.get("seeded"),
+                    bars=seed.get("bars"),
+                    reason=seed.get("reason"),
+                    poc=(seed.get("profile") or {}).get("poc"),
+                    vah=(seed.get("profile") or {}).get("vah"),
+                    val=(seed.get("profile") or {}).get("val"),
+                    message=seed.get("message"),
+                )
             if seed.get("profile"):
                 await self.broadcast({
                     "type": "status",
@@ -1481,6 +1672,8 @@ class ConnectionManager:
                     ),
                 })
         except Exception as e:
+            if self.diag:
+                self.diag.info("va_seed_failed", error=str(e))
             await self.broadcast({
                 "type": "status",
                 "message": f"VA seed failed ({e}); continuing with live-only profile",
@@ -1488,6 +1681,13 @@ class ConnectionManager:
 
         self._live_seed_done = True
         self.engine.entries_enabled = True
+        if self.diag:
+            self.diag.info(
+                "entries_enabled",
+                contract=self.contract_id,
+                account=self.topstep.account_id if self.topstep else None,
+                orders=TOPSTEP_ENABLE_ORDERS,
+            )
         await self.broadcast({
             "type": "status",
             "message": "VA ready — entries enabled",
@@ -1541,6 +1741,8 @@ class ConnectionManager:
                 self.market_hub = None
 
     def stop(self):
+        if self.diag and self.running:
+            self.diag.info("session_stop", mode=self.mode)
         self.running = False
         if self.market_hub:
             try:
