@@ -66,6 +66,8 @@ STOP_SLIP_TICKS = 1
 SESSIONS_DIR = Path("output/sessions")
 REPLAY_SPEEDS = {"10": 10.0, "50": 50.0, "max": None}
 BROKER_SYNC_INTERVAL_SEC = 5.0
+SESSION_HEALTH_INTERVAL_SEC = 20.0
+SESSION_RECLAIM_COOLDOWN_SEC = 15.0
 
 
 # ============================================================================
@@ -772,11 +774,24 @@ class TopstepClient:
     async def validate_session(self) -> bool:
         """POST /api/Auth/validate — refresh token before 24h expiry."""
         response = await self.client.post("/api/Auth/validate", headers=self._headers())
+        if response.status_code in (401, 403):
+            return False
         data = response.json()
         if data.get("success") and data.get("newToken"):
             self.token = data["newToken"]
             return True
         return bool(data.get("success"))
+
+    async def session_healthy(self) -> bool:
+        """Cheap auth probe: validate, then a light authenticated call."""
+        try:
+            if not await self.validate_session():
+                return False
+            # Confirm the token still authorizes account APIs
+            await self.search_accounts(only_active=True)
+            return True
+        except Exception:
+            return False
 
     async def search_accounts(self, only_active: bool = True) -> list[dict]:
         """POST /api/Account/search"""
@@ -1186,6 +1201,15 @@ class ConnectionManager:
             "note": None,
         }
         self._last_broker_sync = 0.0
+        self.topstep_session: dict = {
+            "state": "unknown",  # unknown | ok | lost | reclaiming
+            "message": None,
+            "reason": None,
+            "updated_at": None,
+        }
+        self._reclaiming_session = False
+        self._last_reclaim_attempt = 0.0
+        self._last_session_health = 0.0
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -1287,7 +1311,161 @@ class ConnectionManager:
             return None
         status = self.engine.get_status()
         status["broker"] = dict(self.broker_snapshot)
+        status["topstep_session"] = dict(self.topstep_session)
         return status
+
+    def _set_topstep_session(self, state: str, message: str = None, reason: str = None):
+        self.topstep_session = {
+            "state": state,
+            "message": message,
+            "reason": reason,
+            "updated_at": datetime.now(EASTERN).isoformat(),
+        }
+
+    async def _broadcast_session(self, state: str, message: str, reason: str = None):
+        self._set_topstep_session(state, message=message, reason=reason)
+        await self.broadcast({
+            "type": "session",
+            "state": state,
+            "message": message,
+            "reason": reason,
+            "status": self._engine_status_with_broker(),
+        })
+        if self.diag:
+            self.diag.info(
+                "topstep_session",
+                state=state,
+                message=message,
+                reason=reason,
+            )
+
+    def _looks_like_auth_failure(self, err) -> bool:
+        text = str(err).lower()
+        needles = (
+            "401",
+            "403",
+            "unauthor",
+            "not authenticated",
+            "invalid token",
+            "jwt",
+            "expired",
+            "login",
+            "session",
+        )
+        return any(n in text for n in needles)
+
+    async def _restart_market_hub(self):
+        """Stop/start the SignalR market hub with the current token."""
+        if not (
+            self.running
+            and self.topstep
+            and self.contract_id
+            and self._live_queue is not None
+        ):
+            return
+        loop = asyncio.get_running_loop()
+        if self.market_hub:
+            try:
+                await asyncio.to_thread(self.market_hub.stop)
+            except Exception:
+                pass
+            self.market_hub = None
+
+        self.market_hub = TopstepMarketHub(
+            token_factory=lambda: self.topstep.token,
+            contract_id=self.contract_id,
+            event_queue=self._live_queue,
+            loop=loop,
+            hub_url=TOPSTEP_RTC_URL,
+        )
+        await asyncio.to_thread(self.market_hub.start)
+
+    async def reclaim_topstep_session(self, reason: str) -> bool:
+        """Re-login via loginKey and restart the market hub after a stolen session."""
+        if self.mode != "live" or not self.topstep:
+            return False
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        if self._reclaiming_session:
+            return False
+        if now - self._last_reclaim_attempt < SESSION_RECLAIM_COOLDOWN_SEC:
+            return False
+
+        self._reclaiming_session = True
+        self._last_reclaim_attempt = now
+        try:
+            await self._broadcast_session(
+                "lost",
+                "Topstep session lost — reclaiming…",
+                reason=reason,
+            )
+            await self._broadcast_session(
+                "reclaiming",
+                "Re-logging into Topstep…",
+                reason=reason,
+            )
+
+            ok = await self.topstep.authenticate()
+            if not ok:
+                await self._broadcast_session(
+                    "lost",
+                    "Topstep re-login failed — check credentials / try again",
+                    reason=reason,
+                )
+                return False
+
+            await self._restart_market_hub()
+            self._last_session_health = loop.time()
+            await self._broadcast_session(
+                "ok",
+                "Topstep session reclaimed",
+                reason=reason,
+            )
+            return True
+        except Exception as e:
+            await self._broadcast_session(
+                "lost",
+                f"Topstep reclaim failed: {e}",
+                reason=reason,
+            )
+            return False
+        finally:
+            self._reclaiming_session = False
+
+    async def handle_hub_lost(self, reason: str):
+        """Market hub dropped — restart if auth is fine, otherwise full reclaim."""
+        if self.mode != "live" or not self.topstep or self._reclaiming_session:
+            return
+        healthy = await self.topstep.session_healthy()
+        self._last_session_health = asyncio.get_running_loop().time()
+        if healthy:
+            try:
+                await self._restart_market_hub()
+                await self.broadcast({
+                    "type": "status",
+                    "message": f"Market hub restarted ({reason})",
+                })
+                self._set_topstep_session("ok", message="Topstep session ok")
+            except Exception as e:
+                await self.reclaim_topstep_session(reason=f"hub_restart_failed:{e}")
+            return
+        await self.reclaim_topstep_session(reason=reason)
+
+    async def ensure_topstep_session(self, reason: str = "health") -> bool:
+        """Probe auth health; reclaim automatically if the session was stolen."""
+        if self.mode != "live" or not self.topstep:
+            return True
+        if self._reclaiming_session:
+            return False
+
+        healthy = await self.topstep.session_healthy()
+        self._last_session_health = asyncio.get_running_loop().time()
+        if healthy:
+            if self.topstep_session.get("state") != "ok":
+                self._set_topstep_session("ok", message="Topstep session ok")
+            return True
+
+        return await self.reclaim_topstep_session(reason=reason)
 
     async def sync_broker_position(self, reason: str = "manual") -> dict:
         """Reconcile local engine state against Topstep open positions.
@@ -1982,9 +2160,9 @@ class ConnectionManager:
             hub_url=TOPSTEP_RTC_URL,
         )
         await asyncio.to_thread(self.market_hub.start)
-
-        last_validate = loop.time()
+        self._last_session_health = loop.time()
         self._last_broker_sync = 0.0
+        await self._broadcast_session("ok", "Topstep session ok", reason="live_start")
         try:
             while self.running:
                 try:
@@ -2001,6 +2179,10 @@ class ConnectionManager:
                             "type": "status",
                             "message": event[1],
                         })
+                    elif kind == "hub_lost":
+                        await self.handle_hub_lost(
+                            reason=str(event[1] if len(event) > 1 else "hub_lost")
+                        )
                     elif kind == "trade":
                         await self._process_live_trade(event[2])
                     elif kind == "quote":
@@ -2014,16 +2196,13 @@ class ConnectionManager:
                         if self.diag:
                             self.diag.info("broker_sync_error", error=str(e))
                         self._last_broker_sync = now
+                        if self._looks_like_auth_failure(e):
+                            await self.reclaim_topstep_session(
+                                reason=f"broker_sync:{e}"
+                            )
 
-                if now - last_validate > 60 * 30:
-                    try:
-                        await self.topstep.validate_session()
-                    except Exception as e:
-                        await self.broadcast({
-                            "type": "status",
-                            "message": f"Session validate failed: {e}",
-                        })
-                    last_validate = now
+                if now - self._last_session_health >= SESSION_HEALTH_INTERVAL_SEC:
+                    await self.ensure_topstep_session(reason="health_poll")
         finally:
             if self.market_hub:
                 await asyncio.to_thread(self.market_hub.stop)

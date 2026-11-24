@@ -9,7 +9,7 @@ import {
   ResponsiveContainer,
   Legend,
 } from 'recharts';
-import { playTradeAction } from './sounds.js';
+import { playTradeAction, playSessionLost } from './sounds.js';
 
 const WS_URL = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`;
 const ET = 'America/New_York';
@@ -43,6 +43,7 @@ function App() {
   const [syncing, setSyncing] = useState(false);
   const [replayProgress, setReplayProgress] = useState(null);
   const [soundOn, setSoundOn] = useState(true);
+  const [topstepSession, setTopstepSession] = useState(null);
   const wsRef = useRef(null);
   const soundOnRef = useRef(true);
 
@@ -98,6 +99,9 @@ function App() {
     switch (msg.type) {
       case 'tick':
         setStatus(msg.status);
+        if (msg.status?.topstep_session) {
+          setTopstepSession(msg.status.topstep_session);
+        }
         setTicks((prev) => [
           ...prev.slice(-200),
           {
@@ -109,6 +113,26 @@ function App() {
           },
         ]);
         break;
+      case 'session': {
+        if (msg.status) {
+          setStatus(msg.status);
+        }
+        setTopstepSession({
+          state: msg.state,
+          message: msg.message,
+          reason: msg.reason,
+        });
+        if (msg.state === 'lost' && soundOnRef.current) {
+          playSessionLost();
+        }
+        if (msg.message) {
+          showToast(
+            msg.message,
+            msg.state === 'lost' || msg.state === 'reclaiming'
+          );
+        }
+        break;
+      }
       case 'action':
         if (soundOnRef.current) {
           playTradeAction(msg.data);
@@ -135,6 +159,9 @@ function App() {
         setSyncing(false);
         if (msg.status) {
           setStatus(msg.status);
+          if (msg.status.topstep_session) {
+            setTopstepSession(msg.status.topstep_session);
+          }
         }
         if (msg.message) {
           const bad =
@@ -193,6 +220,7 @@ function App() {
     setPnl(0);
     setReplayProgress(null);
     setStatus(null);
+    setTopstepSession(mode === 'live' ? { state: 'unknown', message: 'Starting…' } : null);
     send({
       command: 'start',
       mode,
@@ -269,6 +297,7 @@ function App() {
     connected &&
     !running &&
     (mode !== 'replay' || Boolean(sessionDate));
+  const liveSession = resolveTopstepSession(topstepSession, status);
 
   return (
     <div className="app">
@@ -279,11 +308,29 @@ function App() {
             MNQ value-area · times in Eastern · entries 10:15–15:00 ET · flatten by 16:00 ET
           </p>
         </div>
-        <div className={`pill ${connected ? 'online' : ''}`}>
-          <span className="pill-dot" />
-          {connected ? 'Connected' : 'Disconnected'}
+        <div className="status-pills">
+          <div className={`pill ${connected ? 'online' : ''}`}>
+            <span className="pill-dot" />
+            {connected ? 'UI connected' : 'UI disconnected'}
+          </div>
+          {mode === 'live' && (
+            <div
+              className={`pill topstep-pill ${topstepPillClass(liveSession)}`}
+              title={liveSession?.reason || liveSession?.message || ''}
+            >
+              <span className="pill-dot" />
+              {topstepSessionLabel(liveSession)}
+            </div>
+          )}
         </div>
       </header>
+
+      {liveSession?.state === 'lost' && (
+        <div className="session-banner">
+          {liveSession.message ||
+            'Topstep session lost — bot will try to reclaim. Avoid logging into the chart.'}
+        </div>
+      )}
 
       {toast && (
         <div className={`toast ${toast.error ? 'error' : ''}`}>{toast.message}</div>
@@ -714,6 +761,38 @@ function brokerLabel(broker) {
   const signed = Number(broker.signed_size || 0);
   if (signed === 0) return 'Broker flat';
   return `Broker ${signed > 0 ? 'LONG' : 'SHORT'} ${Math.abs(signed)}`;
+}
+
+function resolveTopstepSession(session, status) {
+  const fromStatus = status?.topstep_session;
+  if (fromStatus?.state && fromStatus.state !== 'unknown') {
+    return fromStatus;
+  }
+  if (session?.state && session.state !== 'unknown') {
+    return session;
+  }
+  // Broker sync succeeding is a strong signal auth is fine even if the
+  // explicit session event was missed (e.g. page loaded mid-run).
+  if (status?.broker?.synced_at && !status?.broker?.desync) {
+    return { state: 'ok', message: 'Topstep session ok' };
+  }
+  return session || fromStatus || { state: 'unknown' };
+}
+
+function topstepSessionLabel(session) {
+  if (!session?.state || session.state === 'unknown') return 'Topstep connecting';
+  if (session.state === 'ok') return 'Topstep OK';
+  if (session.state === 'reclaiming') return 'Topstep reclaiming';
+  if (session.state === 'lost') return 'Topstep LOST';
+  return `Topstep ${session.state}`;
+}
+
+function topstepPillClass(session) {
+  const state = session?.state;
+  if (state === 'ok') return 'online';
+  if (state === 'reclaiming' || state === 'unknown' || !state) return 'warn';
+  if (state === 'lost') return 'offline';
+  return 'warn';
 }
 
 function RulePill({ label, on, warn = false, muted = false, hint }) {

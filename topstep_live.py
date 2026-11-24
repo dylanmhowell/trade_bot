@@ -199,10 +199,20 @@ class TopstepMarketHub:
         )
         self.connection.on_open(self._on_open)
         self.connection.on_reconnect(self._on_open)
+        self.connection.on_close(self._on_close)
+        self.connection.on_error(self._on_error)
         self.connection.on("GatewayQuote", self._on_quote)
         self.connection.on("GatewayTrade", self._on_trade)
         self.connection.start()
         self._started = True
+
+    def _on_close(self):
+        logger.warning("Market hub closed")
+        self._enqueue(("hub_lost", "market hub closed"))
+
+    def _on_error(self, data=None):
+        logger.warning("Market hub error: %s", data)
+        self._enqueue(("hub_lost", f"market hub error: {data}"))
 
     def stop(self):
         if self.connection and self._started:

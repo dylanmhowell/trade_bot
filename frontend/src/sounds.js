@@ -55,6 +55,13 @@ export function playFlatten() {
   tone(300, 0.12, { type: 'square', gain: 0.035, when: 0.09 });
 }
 
+/** Topstep session stolen / market hub dropped */
+export function playSessionLost() {
+  tone(480, 0.16, { type: 'sawtooth', gain: 0.07 });
+  tone(320, 0.18, { type: 'sawtooth', gain: 0.06, when: 0.14 });
+  tone(180, 0.28, { type: 'square', gain: 0.055, when: 0.3 });
+}
+
 export function playTradeAction(action) {
   if (!action) return;
   if (action.action === 'enter') {

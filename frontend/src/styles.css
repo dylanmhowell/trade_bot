@@ -99,6 +99,13 @@ button:not(:disabled):hover {
   font-size: 0.92rem;
 }
 
+.status-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
 .pill {
   display: inline-flex;
   align-items: center;
@@ -124,6 +131,32 @@ button:not(:disabled):hover {
 .pill.online .pill-dot {
   background: var(--green);
   box-shadow: 0 0 0 4px var(--green-dim);
+}
+
+.pill.warn {
+  color: var(--amber);
+  border-color: color-mix(in srgb, var(--amber) 40%, var(--border));
+}
+
+.pill.warn .pill-dot {
+  background: var(--amber);
+  box-shadow: 0 0 0 4px var(--amber-dim);
+}
+
+.pill.offline {
+  color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 40%, var(--border));
+}
+
+.session-banner {
+  margin: -8px 0 18px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--red) 45%, var(--border));
+  background: var(--red-dim);
+  color: var(--red);
+  font-size: 0.9rem;
+  font-weight: 500;
 }
 
 .panel {
