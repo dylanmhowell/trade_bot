@@ -40,6 +40,7 @@ function App() {
   const [pnl, setPnl] = useState(0);
   const [toast, setToast] = useState(null);
   const [closing, setClosing] = useState(false);
+  const [syncing, setSyncing] = useState(false);
   const [replayProgress, setReplayProgress] = useState(null);
   const [soundOn, setSoundOn] = useState(true);
   const wsRef = useRef(null);
@@ -129,6 +130,18 @@ function App() {
           setStatus(msg.data.engine.status);
         }
         showToast(msg.message || 'Close all finished', !msg.data?.success);
+        break;
+      case 'sync_result':
+        setSyncing(false);
+        if (msg.status) {
+          setStatus(msg.status);
+        }
+        if (msg.message) {
+          const bad =
+            msg.status?.broker?.desync ||
+            String(msg.message).toLowerCase().includes('fail');
+          showToast(msg.message, bad);
+        }
         break;
       case 'broker': {
         const broker = msg.data?.broker;
@@ -220,6 +233,35 @@ function App() {
     if (!send({ command: 'close_all' })) {
       setClosing(false);
     }
+  };
+
+  const syncBroker = async () => {
+    setSyncing(true);
+    try {
+      const res = await fetch('/api/positions/sync', { method: 'POST' });
+      const data = await res.json();
+      if (data?.status) {
+        setStatus(data.status);
+      }
+      if (data?.success) {
+        const note = data.broker?.note || 'ok';
+        showToast(
+          `Broker sync: ${String(note).replaceAll('_', ' ')}`,
+          Boolean(data.broker?.desync)
+        );
+        setSyncing(false);
+        return;
+      }
+      showToast(data.error || 'Broker sync failed', true);
+    } catch {
+      if (!send({ command: 'sync' })) {
+        showToast('Broker sync failed', true);
+        setSyncing(false);
+        return;
+      }
+      return;
+    }
+    setSyncing(false);
   };
 
   const inPosition = Boolean(status?.in_position);
@@ -348,6 +390,16 @@ function App() {
           title="Flatten positions and cancel open orders"
         >
           {closing ? 'Closing…' : 'Close all positions'}
+        </button>
+
+        <button
+          type="button"
+          className="btn btn-ghost"
+          onClick={syncBroker}
+          disabled={!connected || syncing}
+          title="Pull Topstep open position and reconcile engine state"
+        >
+          {syncing ? 'Syncing…' : 'Sync broker'}
         </button>
 
         <button
@@ -638,13 +690,30 @@ function RuleIndicators({ status }) {
           muted={status.poc_distance_ok == null}
           hint="VA line must be ≥30 pts from POC"
         />
+        <RulePill
+          label={brokerLabel(status.broker)}
+          on={Boolean(status.broker?.synced_at) && !status.broker?.desync}
+          warn={Boolean(status.broker?.desync)}
+          muted={!status.broker?.synced_at}
+          hint="Topstep open size vs local engine"
+        />
       </div>
       <p className="rules-detail">
         {armDetail}
         {lastVsTrigger ? ` · ${lastVsTrigger}` : ''}
+        {status.broker?.note
+          ? ` · broker ${String(status.broker.note).replaceAll('_', ' ')}`
+          : ''}
       </p>
     </section>
   );
+}
+
+function brokerLabel(broker) {
+  if (!broker?.synced_at) return 'Broker';
+  const signed = Number(broker.signed_size || 0);
+  if (signed === 0) return 'Broker flat';
+  return `Broker ${signed > 0 ? 'LONG' : 'SHORT'} ${Math.abs(signed)}`;
 }
 
 function RulePill({ label, on, warn = false, muted = false, hint }) {

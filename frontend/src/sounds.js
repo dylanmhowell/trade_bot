@@ -68,7 +68,12 @@ export function playTradeAction(action) {
     playStop();
   } else if (reason === 'target') {
     playTakeProfit();
-  } else if (reason === 'session_close' || reason === 'manual_close') {
+  } else if (
+    reason === 'session_close' ||
+    reason === 'manual_close' ||
+    reason === 'external_flat' ||
+    reason === 'external_partial'
+  ) {
     playFlatten();
   }
 }

@@ -65,6 +65,7 @@ STOP_SLIP_TICKS = 1
 
 SESSIONS_DIR = Path("output/sessions")
 REPLAY_SPEEDS = {"10": 10.0, "50": 50.0, "max": None}
+BROKER_SYNC_INTERVAL_SEC = 5.0
 
 
 # ============================================================================
@@ -554,7 +555,60 @@ class KTwoLot60Engine:
         if self.diag:
             self.diag.state_change(self.state.value, ts=ts)
         return actions
-    
+
+    def _close_n_legs(self, n: int, reason: str, price: int, ts: datetime) -> list[dict]:
+        """Close up to n open legs at mark (used for broker size reconciliation)."""
+        actions = []
+        pos = self.position
+        if not pos or n <= 0:
+            return actions
+
+        fill = price - STOP_SLIP_TICKS if pos.direction == 1 else price + STOP_SLIP_TICKS
+        closed = 0
+        for i, leg in enumerate(pos.legs):
+            if closed >= n:
+                break
+            if not leg.open:
+                continue
+            leg.open = False
+            leg.filled_price = fill
+            leg.filled_time = ts
+            ch = (fill - pos.entry_price) * pos.direction
+            pos.gross_pnl_cents += ch * TICK_CENTS
+            actions.append({
+                "action": "exit",
+                "leg": i,
+                "kind": leg.kind,
+                "price": fill,
+                "reason": reason,
+                "timestamp": ts.isoformat(),
+            })
+            if self.diag:
+                self.diag.info(
+                    "exit",
+                    ts=ts,
+                    reason=reason,
+                    leg=i,
+                    kind=leg.kind,
+                    fill=self._px(fill),
+                    entry=self._px(pos.entry_price),
+                )
+            closed += 1
+
+        if not any(leg.open for leg in pos.legs):
+            actions.extend(self._record_trade(ts))
+            self.position = None
+            self.state = State.FLAT
+            if self.diag:
+                self.diag.state_change(self.state.value, ts=ts)
+
+        return actions
+
+    def open_leg_count(self) -> int:
+        if not self.position:
+            return 0
+        return sum(1 for leg in self.position.legs if leg.open)
+
     def _record_trade(self, ts: datetime) -> list[dict]:
         """Record completed trade to history."""
         pos = self.position
@@ -756,6 +810,30 @@ class TopstepClient:
         if not data.get("success"):
             raise RuntimeError(data.get("errorMessage") or "Position search failed")
         return data.get("positions") or []
+
+    async def search_trades(
+        self,
+        start_timestamp: datetime,
+        end_timestamp: Optional[datetime] = None,
+    ) -> list[dict]:
+        """POST /api/Trade/search — half-turn fills for the account."""
+        if self.account_id is None:
+            raise RuntimeError("account_id is required")
+        payload = {
+            "accountId": self.account_id,
+            "startTimestamp": start_timestamp.isoformat(),
+        }
+        if end_timestamp is not None:
+            payload["endTimestamp"] = end_timestamp.isoformat()
+        response = await self.client.post(
+            "/api/Trade/search",
+            headers=self._headers(),
+            json=payload,
+        )
+        data = response.json()
+        if not data.get("success"):
+            raise RuntimeError(data.get("errorMessage") or "Trade search failed")
+        return data.get("trades") or []
 
     async def search_open_orders(self) -> list[dict]:
         """POST /api/Order/searchOpen"""
@@ -1015,6 +1093,21 @@ class TopstepClient:
 # Connection Manager
 # ============================================================================
 
+def _broker_signed_size(position: Optional[dict]) -> int:
+    """Map Topstep position type/size to signed contracts (long +, short -)."""
+    if not position:
+        return 0
+    size = int(position.get("size") or 0)
+    if size <= 0:
+        return 0
+    ptype = int(position.get("type") or 0)
+    if ptype == 2:  # Short
+        return -size
+    if ptype == 1:  # Long
+        return size
+    return size
+
+
 def _flatten_broker_log(result: dict) -> dict:
     """Flatten nested broker payloads for one-line log fields."""
     broker = result.get("broker") or {}
@@ -1083,6 +1176,16 @@ class ConnectionManager:
         self.value_area = DevelopingValueArea()
         self._live_queue: Optional[asyncio.Queue] = None
         self.diag: Optional[LiveDiagLog] = None
+        self.broker_snapshot: dict = {
+            "size": 0,
+            "signed_size": 0,
+            "average_price": None,
+            "contract_id": None,
+            "synced_at": None,
+            "desync": False,
+            "note": None,
+        }
+        self._last_broker_sync = 0.0
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -1178,6 +1281,135 @@ class ConnectionManager:
         if not ok:
             raise RuntimeError("TopstepX authentication failed")
         return self.topstep
+
+    def _engine_status_with_broker(self) -> Optional[dict]:
+        if not self.engine:
+            return None
+        status = self.engine.get_status()
+        status["broker"] = dict(self.broker_snapshot)
+        return status
+
+    async def sync_broker_position(self, reason: str = "manual") -> dict:
+        """Reconcile local engine state against Topstep open positions.
+
+        Detects external flattens / partial closes (e.g. Topstep auto TP) and
+        books them on the engine without sending more broker orders.
+        """
+        client = await self.ensure_topstep()
+        positions = await client.search_open_positions()
+        contract_id = self.contract_id
+        match = None
+        if contract_id:
+            match = next(
+                (p for p in positions if p.get("contractId") == contract_id),
+                None,
+            )
+        elif positions:
+            match = positions[0]
+            contract_id = match.get("contractId")
+
+        signed = _broker_signed_size(match)
+        abs_size = abs(signed)
+        ts = datetime.now(EASTERN)
+        mark = (
+            self.engine.prev_price
+            if self.engine and self.engine.prev_price is not None
+            else None
+        )
+        if mark is None and match and match.get("averagePrice") is not None:
+            mark = price_to_ticks(float(match["averagePrice"]))
+        if mark is None:
+            mark = 0
+
+        note = "ok"
+        desync = False
+        reconciled: list[dict] = []
+        engine_legs = self.engine.open_leg_count() if self.engine else 0
+        engine_dir = (
+            self.engine.position.direction
+            if self.engine and self.engine.position
+            else 0
+        )
+        engine_signed = engine_dir * engine_legs
+
+        if self.engine and engine_legs > 0 and abs_size == 0:
+            # Broker already flat — something else closed us out
+            reconciled = self.engine._close_all("external_flat", mark, ts)
+            note = "engine_flattened_external"
+            desync = True
+        elif self.engine and engine_legs > 0 and abs_size > 0:
+            same_side = (engine_signed > 0 and signed > 0) or (
+                engine_signed < 0 and signed < 0
+            )
+            if not same_side:
+                note = "broker_opposite_side"
+                desync = True
+            elif abs_size < engine_legs:
+                reconciled = self.engine._close_n_legs(
+                    engine_legs - abs_size, "external_partial", mark, ts
+                )
+                note = "engine_trimmed_to_broker"
+                desync = True
+            elif abs_size > engine_legs:
+                note = "broker_larger_than_engine"
+                desync = True
+        elif self.engine and engine_legs == 0 and abs_size > 0:
+            note = "broker_open_engine_flat"
+            desync = True
+
+        self.broker_snapshot = {
+            "size": abs_size,
+            "signed_size": signed,
+            "average_price": (
+                float(match["averagePrice"])
+                if match and match.get("averagePrice") is not None
+                else None
+            ),
+            "contract_id": contract_id,
+            "synced_at": ts.isoformat(),
+            "desync": desync,
+            "note": note,
+            "reason": reason,
+        }
+        self._last_broker_sync = asyncio.get_running_loop().time()
+
+        if self.diag:
+            self.diag.info(
+                "broker_sync",
+                reason=reason,
+                broker_size=abs_size,
+                broker_signed=signed,
+                engine_legs=self.engine.open_leg_count() if self.engine else 0,
+                note=note,
+                desync=desync,
+            )
+
+        # Broadcast local exits / trade summaries without placing new orders
+        for action in reconciled:
+            await self.broadcast({"type": "action", "data": action})
+
+        status = self._engine_status_with_broker()
+        # Quiet on routine polls unless something changed / looked wrong
+        notify = reason != "poll" or desync or bool(reconciled)
+        if status and notify:
+            await self.broadcast({
+                "type": "sync_result",
+                "status": status,
+                "reconciled": len(reconciled),
+                "message": (
+                    f"Broker sync: {note.replace('_', ' ')}"
+                    f" · broker {signed:+d} · engine legs "
+                    f"{self.engine.open_leg_count() if self.engine else 0}"
+                ),
+            })
+
+        return {
+            "success": True,
+            "broker": dict(self.broker_snapshot),
+            "reconciled_actions": len(reconciled),
+            "status": status,
+            "positions": positions,
+        }
 
     async def close_all_positions(self, price: Optional[int] = None) -> dict:
         """Flatten broker positions (live) and/or local engine position (sim)."""
@@ -1471,6 +1703,20 @@ class ConnectionManager:
                             await self.broadcast({"type": "broker", "data": result})
                             if self.diag:
                                 self.diag.info("broker", **_flatten_broker_log(result))
+                            broker = result.get("broker") or {}
+                            if broker.get("success") is False:
+                                # Likely already flat via Topstep rule / race —
+                                # pull truth from broker and reconcile engine.
+                                try:
+                                    await self.sync_broker_position(
+                                        reason="after_failed_exit"
+                                    )
+                                except Exception as sync_err:
+                                    if self.diag:
+                                        self.diag.info(
+                                            "broker_sync_error",
+                                            error=str(sync_err),
+                                        )
         except Exception as e:
             if self.diag:
                 self.diag.info("broker_error", error=str(e))
@@ -1478,6 +1724,10 @@ class ConnectionManager:
                 "type": "status",
                 "message": f"Broker action error: {e}",
             })
+            try:
+                await self.sync_broker_position(reason="after_broker_error")
+            except Exception:
+                pass
 
     async def _broadcast_live_tick(self, price: float, ts: datetime, force: bool = False):
         if not self.engine:
@@ -1491,7 +1741,7 @@ class ConnectionManager:
             "type": "tick",
             "price": price,
             "timestamp": ts.isoformat(),
-            "status": self.engine.get_status(),
+            "status": self._engine_status_with_broker(),
         })
 
     async def _process_live_trade(self, payload: dict):
@@ -1734,6 +1984,7 @@ class ConnectionManager:
         await asyncio.to_thread(self.market_hub.start)
 
         last_validate = loop.time()
+        self._last_broker_sync = 0.0
         try:
             while self.running:
                 try:
@@ -1756,6 +2007,14 @@ class ConnectionManager:
                         await self._process_live_quote(event[2])
 
                 now = loop.time()
+                if now - self._last_broker_sync >= BROKER_SYNC_INTERVAL_SEC:
+                    try:
+                        await self.sync_broker_position(reason="poll")
+                    except Exception as e:
+                        if self.diag:
+                            self.diag.info("broker_sync_error", error=str(e))
+                        self._last_broker_sync = now
+
                 if now - last_validate > 60 * 30:
                     try:
                         await self.topstep.validate_session()
@@ -1881,6 +2140,24 @@ async def websocket_endpoint(websocket: WebSocket):
                         "message": f"Close all failed: {e}",
                     })
 
+            elif cmd == "sync":
+                try:
+                    result = await manager.sync_broker_position(reason="manual")
+                    await websocket.send_json({
+                        "type": "sync_result",
+                        "status": result.get("status"),
+                        "reconciled": result.get("reconciled_actions", 0),
+                        "message": (
+                            f"Broker sync: {(result.get('broker') or {}).get('note', 'ok')}"
+                        ),
+                        "data": result,
+                    })
+                except Exception as e:
+                    await websocket.send_json({
+                        "type": "status",
+                        "message": f"Broker sync failed: {e}",
+                    })
+
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
@@ -1914,6 +2191,15 @@ async def get_positions():
         client = await manager.ensure_topstep()
         positions = await client.search_open_positions()
         return {"success": True, "positions": positions, "accountId": client.account_id}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/positions/sync")
+async def sync_positions():
+    """Reconcile engine state with Topstep open positions."""
+    try:
+        return await manager.sync_broker_position(reason="api")
     except Exception as e:
         return {"success": False, "error": str(e)}
 
