@@ -595,17 +595,47 @@ class KTwoLot60Engine:
         self._mark_equity(unrealized)
         daily_pnl = self.daily_realized_cents + unrealized
 
+        trigger = None
+        trigger_side = None
+        poc_dist_ok = None
+        if self.state == State.ARMED_SHORT and self.profile.vah:
+            trigger = self.profile.vah / 4.0
+            trigger_side = "short"
+            poc_dist_ok = abs(self.profile.poc - self.profile.vah) >= MIN_POC_DIST
+        elif self.state == State.ARMED_LONG and self.profile.val:
+            trigger = self.profile.val / 4.0
+            trigger_side = "long"
+            poc_dist_ok = abs(self.profile.poc - self.profile.val) >= MIN_POC_DIST
+
+        armed = self.state in (State.ARMED_SHORT, State.ARMED_LONG)
+        can_enter = bool(
+            self.entries_enabled
+            and self.entry_window_open
+            and armed
+            and not self.position
+            and poc_dist_ok
+        )
+
         return {
             "state": self.state.value,
             "in_position": self.position is not None and self.position.direction != 0,
             "direction": "long" if self.position and self.position.direction == 1 else
                         "short" if self.position and self.position.direction == -1 else "flat",
             "entry_price": self.position.entry_price / 4.0 if self.position else 0,
+            "last_price": self.prev_price / 4.0 if self.prev_price is not None else None,
             "unrealized_pnl": unrealized / 100.0,
             "daily_pnl": daily_pnl / 100.0,
             "realized_pnl": self.daily_realized_cents / 100.0,
             "max_drawdown": self.max_drawdown_cents / 100.0,
             "entries_enabled": self.entries_enabled,
+            "entry_window_open": self.entry_window_open,
+            "rth_active": self.rth_active,
+            "origin": self.origin,
+            "armed": armed,
+            "trigger_side": trigger_side,
+            "trigger_price": trigger,
+            "poc_distance_ok": poc_dist_ok,
+            "can_enter": can_enter,
             "daily_trades": len(self.daily_trades),
             "total_commission": self.total_commission_cents / 100.0,
             "profile": {

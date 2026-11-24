@@ -12,6 +12,20 @@ import {
 import { playTradeAction } from './sounds.js';
 
 const WS_URL = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`;
+const ET = 'America/New_York';
+
+/** Format timestamps in US/Eastern so UI matches strategy rules. */
+function formatEtTime(value) {
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleTimeString('en-US', {
+    timeZone: ET,
+    hour: 'numeric',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: true,
+  });
+}
 
 function App() {
   const [connected, setConnected] = useState(false);
@@ -86,7 +100,7 @@ function App() {
         setTicks((prev) => [
           ...prev.slice(-200),
           {
-            time: new Date(msg.timestamp).toLocaleTimeString(),
+            time: formatEtTime(msg.timestamp),
             price: msg.price,
             poc: msg.status?.profile?.poc ?? null,
             vah: msg.status?.profile?.vah ?? null,
@@ -219,7 +233,9 @@ function App() {
       <header className="topbar">
         <div className="brand">
           <h1>Dillybar's Value Area Trade Bot</h1>
-          <p>MNQ value-area strategy · TopstepX gateway</p>
+          <p>
+            MNQ value-area · times in Eastern · entries 10:15–15:00 ET · flatten by 16:00 ET
+          </p>
         </div>
         <div className={`pill ${connected ? 'online' : ''}`}>
           <span className="pill-dot" />
@@ -295,11 +311,18 @@ function App() {
           )}
 
           {mode === 'test' && (
-            <p className="mode-hint">Random-walk ticks with a fixed sample value area.</p>
+            <p className="mode-hint">
+              Random-walk ticks with a fixed sample value area. Session clock uses Eastern.
+            </p>
+          )}
+          {mode === 'replay' && (
+            <p className="mode-hint">
+              Replays historical RTH ticks. Chart times and entry rules are Eastern.
+            </p>
           )}
           {mode === 'live' && (
             <p className="mode-hint">
-              Seeds today&apos;s VA from Topstep history before enabling entries, then streams live MNQ trades.
+              Seeds today&apos;s VA from history, then streams live MNQ. All session rules are Eastern.
             </p>
           )}
         </div>
@@ -338,43 +361,47 @@ function App() {
       </section>
 
       {status && (
-        <section className="status-grid">
-          <StatusCard
-            title="Position"
-            value={
-              inPosition
-                ? `${status.direction.toUpperCase()} @ ${status.entry_price.toFixed(2)}`
-                : 'FLAT'
-            }
-            color={
-              inPosition
-                ? status.direction === 'long'
-                  ? 'var(--green)'
-                  : 'var(--red)'
-                : 'var(--text-dim)'
-            }
-          />
-          <StatusCard
-            title="Unrealized P&L"
-            value={`$${Number(status.unrealized_pnl || 0).toFixed(2)}`}
-            color={(status.unrealized_pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)'}
-          />
-          <StatusCard
-            title="Daily P&L"
-            value={`$${Number(status.daily_pnl || 0).toFixed(2)}`}
-            color={(status.daily_pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)'}
-          />
-          <StatusCard
-            title="Max drawdown"
-            value={`-$${Number(status.max_drawdown || 0).toFixed(2)}`}
-            color={(status.max_drawdown || 0) > 0 ? 'var(--red)' : 'var(--text-dim)'}
-          />
-          <StatusCard title="Daily trades" value={status.daily_trades} />
-          <StatusCard
-            title="Commission"
-            value={`$${Number(status.total_commission || 0).toFixed(2)}`}
-          />
-        </section>
+        <>
+          <RuleIndicators status={status} />
+
+          <section className="status-grid">
+            <StatusCard
+              title="Position"
+              value={
+                inPosition
+                  ? `${status.direction.toUpperCase()} @ ${status.entry_price.toFixed(2)}`
+                  : 'FLAT'
+              }
+              color={
+                inPosition
+                  ? status.direction === 'long'
+                    ? 'var(--green)'
+                    : 'var(--red)'
+                  : 'var(--text-dim)'
+              }
+            />
+            <StatusCard
+              title="Unrealized P&L"
+              value={`$${Number(status.unrealized_pnl || 0).toFixed(2)}`}
+              color={(status.unrealized_pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)'}
+            />
+            <StatusCard
+              title="Daily P&L"
+              value={`$${Number(status.daily_pnl || 0).toFixed(2)}`}
+              color={(status.daily_pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)'}
+            />
+            <StatusCard
+              title="Max drawdown"
+              value={`-$${Number(status.max_drawdown || 0).toFixed(2)}`}
+              color={(status.max_drawdown || 0) > 0 ? 'var(--red)' : 'var(--text-dim)'}
+            />
+            <StatusCard title="Daily trades" value={status.daily_trades} />
+            <StatusCard
+              title="Commission"
+              value={`$${Number(status.total_commission || 0).toFixed(2)}`}
+            />
+          </section>
+        </>
       )}
 
       {status?.profile && (
@@ -398,7 +425,7 @@ function App() {
       )}
 
       <section className="panel chart-panel">
-        <h3 className="section-title">Price</h3>
+        <h3 className="section-title">Price (Eastern)</h3>
         <div className="chart-wrap">
           {ticks.length === 0 ? (
             <div className="empty">
@@ -506,7 +533,7 @@ function App() {
               <tbody>
                 {trades.map((t, i) => (
                   <tr key={`${t.exit_time}-${i}`}>
-                    <td>{new Date(t.exit_time).toLocaleTimeString()}</td>
+                    <td>{formatEtTime(t.exit_time)}</td>
                     <td>{t.direction.toUpperCase()}</td>
                     <td>{t.entry_price.toFixed(2)}</td>
                     <td className={t.gross_pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}>
@@ -541,6 +568,91 @@ function StatusCard({ title, value, color = 'var(--text)' }) {
       <div className="stat-value" style={{ color }}>
         {value}
       </div>
+    </div>
+  );
+}
+
+function RuleIndicators({ status }) {
+  const inPosition = status.in_position;
+  const armed = !!status.armed;
+  const triggerSide = status.trigger_side;
+  const triggerPrice = status.trigger_price;
+  const lastPrice = status.last_price;
+  const canEnter = !!status.can_enter;
+
+  let armDetail = 'Waiting for POC cross to arm';
+  if (inPosition) {
+    armDetail = `In ${status.direction} — no new entries`;
+  } else if (armed && triggerSide === 'short' && triggerPrice != null) {
+    armDetail = `Armed SHORT — fires on cross up through VAH ${triggerPrice.toFixed(2)}`;
+  } else if (armed && triggerSide === 'long' && triggerPrice != null) {
+    armDetail = `Armed LONG — fires on cross down through VAL ${triggerPrice.toFixed(2)}`;
+  } else if (status.state === 'flat' && status.origin === 0) {
+    armDetail = 'Flat — establishing origin vs POC';
+  }
+
+  const lastVsTrigger =
+    armed && lastPrice != null && triggerPrice != null
+      ? `Last ${lastPrice.toFixed(2)} · trigger ${triggerPrice.toFixed(2)}`
+      : null;
+
+  return (
+    <section className="panel rules-panel">
+      <div className="rules-header">
+        <h3 className="section-title">Rules</h3>
+        <span className={`rules-ready ${canEnter ? 'on' : ''}`}>
+          {canEnter ? 'Ready to fire' : inPosition ? 'In trade' : 'Not ready'}
+        </span>
+      </div>
+      <div className="rules-grid">
+        <RulePill
+          label="VA seeded"
+          on={!!status.entries_enabled}
+          hint="Entries unlock after value area is built"
+        />
+        <RulePill
+          label="Entry window"
+          on={!!status.entry_window_open}
+          hint="10:15–15:00 ET"
+        />
+        <RulePill
+          label="RTH"
+          on={!!status.rth_active}
+          hint="09:30–16:00 ET"
+        />
+        <RulePill
+          label={
+            armed
+              ? triggerSide === 'short'
+                ? 'Armed SHORT @ VAH'
+                : 'Armed LONG @ VAL'
+              : 'Armed'
+          }
+          on={armed && !inPosition}
+          warn={inPosition}
+          hint={armDetail}
+        />
+        <RulePill
+          label="POC distance"
+          on={status.poc_distance_ok === true}
+          muted={status.poc_distance_ok == null}
+          hint="VA line must be ≥30 pts from POC"
+        />
+      </div>
+      <p className="rules-detail">
+        {armDetail}
+        {lastVsTrigger ? ` · ${lastVsTrigger}` : ''}
+      </p>
+    </section>
+  );
+}
+
+function RulePill({ label, on, warn = false, muted = false, hint }) {
+  const tone = muted ? 'muted' : warn ? 'warn' : on ? 'on' : 'off';
+  return (
+    <div className={`rule-pill ${tone}`} title={hint}>
+      <span className="rule-dot" aria-hidden />
+      <span className="rule-label">{label}</span>
     </div>
   );
 }
