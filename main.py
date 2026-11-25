@@ -4,7 +4,7 @@ import asyncio
 import json
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, time as clock, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -14,9 +14,11 @@ import httpx
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from zoneinfo import ZoneInfo
 
 from backtest_va import from_100ns, rth_profile_for_session
+from config import settings
 from live_log import LiveDiagLog
 from topstep_live import (
     DevelopingValueArea,
@@ -31,8 +33,6 @@ from topstep_live import (
 # ============================================================================
 # Configuration
 # ============================================================================
-
-from config import settings
 
 TOPSTEP_USERNAME = settings.topstep_username
 TOPSTEP_API_KEY = settings.topstep_api_key
@@ -74,6 +74,14 @@ SESSION_RECLAIM_COOLDOWN_SEC = 15.0
 # Data Models
 # ============================================================================
 
+class TopstepAuthError(RuntimeError):
+    """Raised when TopstepX returns 401/403 or an invalid/expired token."""
+
+
+class RunnerTPRequest(BaseModel):
+    price: float
+
+
 class State(Enum):
     FLAT = "flat"
     ARMED_SHORT = "armed_short"  # Below VAH, waiting for cross up through VAH
@@ -106,7 +114,7 @@ class Position:
     entry_time: Optional[datetime] = None
     legs: list = None
     gross_pnl_cents: int = 0
-    
+
     def __post_init__(self):
         if self.legs is None:
             self.legs = [Leg(), Leg()]
@@ -123,7 +131,7 @@ class TradeSummary:
     commission: float = 0.0
     net_pnl: float = 0.0
     exit_reasons: list = None
-    
+
     def __post_init__(self):
         if self.exit_reasons is None:
             self.exit_reasons = []
@@ -142,6 +150,7 @@ class KTwoLot60Engine:
         self.position: Optional[Position] = None
         self.origin = 0           # 1 = above POC, -1 = below POC
         self.prev_price: Optional[int] = None
+        self.mark_price: Optional[int] = None
         self.diag = diag
 
         # Session state
@@ -168,6 +177,7 @@ class KTwoLot60Engine:
     def on_tick(self, price: int, ts: datetime, is_rth: bool) -> list[dict]:
         """Process a single tick. Returns list of actions to execute."""
         actions = []
+        self.mark_price = price
 
         # Update session timing
         self._update_session_state(ts, is_rth)
@@ -202,7 +212,9 @@ class KTwoLot60Engine:
                 # Only note when a trigger cross actually happens
                 self._check_entry(price, ts, log_only_block="entries_disabled")
             elif not self.entry_window_open:
-                self._check_entry(price, ts, log_only_block="outside_entry_window")
+                self._check_entry(
+                    price, ts, log_only_block="outside_entry_window"
+                )
             else:
                 entry_action = self._check_entry(price, ts)
                 if entry_action:
@@ -216,8 +228,9 @@ class KTwoLot60Engine:
         """Update entry window and RTH state."""
         self.rth_active = is_rth
 
-        t = ts.astimezone(EASTERN).time()
-        date = ts.astimezone(EASTERN).date().isoformat()
+        ts_et = ts.astimezone(EASTERN)
+        t = ts_et.time()
+        date = ts_et.date().isoformat()
 
         if date != self.session_date:
             self.session_date = date
@@ -226,6 +239,11 @@ class KTwoLot60Engine:
             self.equity_peak_cents = 0
             self.max_drawdown_cents = 0
             self.total_commission_cents = 0
+            if not self.position:
+                self.state = State.FLAT
+                self.origin = 0
+                self.prev_price = None
+                self.mark_price = None
 
         entry_start = clock(ENTRY_HOUR, ENTRY_MINUTE)
         self.entry_window_open = entry_start <= t < ENTRY_END
@@ -237,12 +255,17 @@ class KTwoLot60Engine:
             )
 
     def _unrealized_cents(self) -> int:
-        if not self.position or self.prev_price is None:
+        ref_price = (
+            self.mark_price if self.mark_price is not None else self.prev_price
+        )
+        if not self.position or ref_price is None:
             return 0
         unrealized = 0
         for leg in self.position.legs:
             if leg.open:
-                ch = (self.prev_price - self.position.entry_price) * self.position.direction
+                ch = (ref_price - self.position.entry_price) * (
+                    self.position.direction
+                )
                 unrealized += ch * TICK_CENTS
         return unrealized
 
@@ -255,7 +278,9 @@ class KTwoLot60Engine:
         if drawdown > self.max_drawdown_cents:
             self.max_drawdown_cents = drawdown
 
-    def _update_crossing_state(self, price: int, ts: Optional[datetime] = None):
+    def _update_crossing_state(
+        self, price: int, ts: Optional[datetime] = None
+    ):
         """Update POC crossing armed state."""
         if self.profile.poc == 0:
             return
@@ -269,12 +294,11 @@ class KTwoLot60Engine:
             elif self.origin == 1 and price < self.profile.poc:
                 self.state = State.ARMED_LONG
 
+        # Preserve prior origin when price prints directly on the POC
         if price > self.profile.poc:
             self.origin = 1
         elif price < self.profile.poc:
             self.origin = -1
-        else:
-            self.origin = 0
 
         if self.diag and self.state != prev_state:
             self.diag.state_change(
@@ -300,7 +324,11 @@ class KTwoLot60Engine:
         if self.state == State.ARMED_SHORT:
             trigger = self.profile.vah
             # Must be below VAH and cross up through it
-            if self.prev_price and self.prev_price < trigger and price >= trigger:
+            if (
+                self.prev_price is not None
+                and self.prev_price < trigger
+                and price >= trigger
+            ):
                 dist = abs(self.profile.poc - trigger)
                 if dist < MIN_POC_DIST:
                     if self.diag:
@@ -331,7 +359,11 @@ class KTwoLot60Engine:
         elif self.state == State.ARMED_LONG:
             trigger = self.profile.val
             # Must be above VAL and cross down through it
-            if self.prev_price and self.prev_price > trigger and price <= trigger:
+            if (
+                self.prev_price is not None
+                and self.prev_price > trigger
+                and price <= trigger
+            ):
                 dist = abs(self.profile.poc - trigger)
                 if dist < MIN_POC_DIST:
                     if self.diag:
@@ -361,13 +393,18 @@ class KTwoLot60Engine:
 
         return None
 
-    def _enter_position(self, direction: int, price: int, ts: datetime,
-                       trigger_price: int) -> dict:
+    def _enter_position(
+        self,
+        direction: int,
+        price: int,
+        ts: datetime,
+        trigger_price: int,
+    ) -> dict:
         """Create entry action and initialize position."""
         self.position = Position(
             direction=direction,
             entry_price=price,
-            entry_time=ts
+            entry_time=ts,
         )
         self.state = State.IN_POSITION
 
@@ -416,25 +453,69 @@ class KTwoLot60Engine:
             "price": price,
             "quantity": LOTS,
             "legs": [
-                {"target": self.position.legs[0].target, "stop": stop, "kind": "tp1"},
-                {"target": self.position.legs[1].target, "stop": stop, "kind": "opp"}
+                {
+                    "target": self.position.legs[0].target,
+                    "stop": stop,
+                    "kind": "tp1",
+                },
+                {
+                    "target": self.position.legs[1].target,
+                    "stop": stop,
+                    "kind": "opp",
+                },
             ],
-            "timestamp": ts.isoformat()
+            "timestamp": ts.isoformat(),
         }
-    
+
+    def sync_entry_fill_price(self, fill_ticks: int) -> Optional[list[dict]]:
+        """Re-anchor entry, TP1, and stop to the actual broker fill price."""
+        pos = self.position
+        if not pos or pos.direction == 0:
+            return None
+        pos.entry_price = fill_ticks
+        stop = fill_ticks - pos.direction * STOP_TICKS
+        pos.legs[0].target = fill_ticks + pos.direction * TP1_TICKS
+        pos.legs[0].stop = stop
+        pos.legs[1].stop = stop
+        return [
+            {
+                "target": pos.legs[0].target,
+                "stop": stop,
+                "kind": pos.legs[0].kind,
+            },
+            {
+                "target": pos.legs[1].target,
+                "stop": stop,
+                "kind": pos.legs[1].kind,
+            },
+        ]
+
+    def abort_unfilled_entry(self, ts: Optional[datetime] = None):
+        """Roll back local position state if the broker rejected an entry."""
+        if not self.position:
+            return
+        self.total_commission_cents = max(
+            0, self.total_commission_cents - LOTS * COMMISSION_CENTS
+        )
+        self.position = None
+        self.state = State.FLAT
+        if self.diag:
+            self.diag.info("entry_aborted", ts=ts)
+            self.diag.state_change(self.state.value, ts=ts)
+
     def _check_exits(self, price: int, ts: datetime) -> list[dict]:
         """Check if any legs should exit."""
         actions = []
         pos = self.position
         if not pos or pos.direction == 0:
             return actions
-        
+
         all_closed = True
-        
+
         for i, leg in enumerate(pos.legs):
             if not leg.open:
                 continue
-            
+
             # Check stop first
             stop_hit = False
             if pos.direction == 1 and price <= leg.stop:
@@ -443,7 +524,7 @@ class KTwoLot60Engine:
             elif pos.direction == -1 and price >= leg.stop:
                 stop_hit = True
                 fill = leg.stop + STOP_SLIP_TICKS
-            
+
             if stop_hit:
                 leg.open = False
                 leg.filled_price = fill
@@ -456,7 +537,7 @@ class KTwoLot60Engine:
                     "kind": leg.kind,
                     "price": fill,
                     "reason": "stop",
-                    "timestamp": ts.isoformat()
+                    "timestamp": ts.isoformat(),
                 })
                 if self.diag:
                     self.diag.info(
@@ -491,7 +572,7 @@ class KTwoLot60Engine:
                     "kind": leg.kind,
                     "price": fill,
                     "reason": "target",
-                    "timestamp": ts.isoformat()
+                    "timestamp": ts.isoformat(),
                 })
                 if self.diag:
                     self.diag.info(
@@ -523,7 +604,11 @@ class KTwoLot60Engine:
         if not pos:
             return actions
 
-        fill = price - STOP_SLIP_TICKS if pos.direction == 1 else price + STOP_SLIP_TICKS
+        fill = (
+            price - STOP_SLIP_TICKS
+            if pos.direction == 1
+            else price + STOP_SLIP_TICKS
+        )
 
         for i, leg in enumerate(pos.legs):
             if leg.open:
@@ -538,7 +623,7 @@ class KTwoLot60Engine:
                     "kind": leg.kind,
                     "price": fill,
                     "reason": reason,
-                    "timestamp": ts.isoformat()
+                    "timestamp": ts.isoformat(),
                 })
                 if self.diag:
                     self.diag.info(
@@ -558,14 +643,20 @@ class KTwoLot60Engine:
             self.diag.state_change(self.state.value, ts=ts)
         return actions
 
-    def _close_n_legs(self, n: int, reason: str, price: int, ts: datetime) -> list[dict]:
-        """Close up to n open legs at mark (used for broker size reconciliation)."""
+    def _close_n_legs(
+        self, n: int, reason: str, price: int, ts: datetime
+    ) -> list[dict]:
+        """Close up to n open legs at mark (broker size reconciliation)."""
         actions = []
         pos = self.position
         if not pos or n <= 0:
             return actions
 
-        fill = price - STOP_SLIP_TICKS if pos.direction == 1 else price + STOP_SLIP_TICKS
+        fill = (
+            price - STOP_SLIP_TICKS
+            if pos.direction == 1
+            else price + STOP_SLIP_TICKS
+        )
         closed = 0
         for i, leg in enumerate(pos.legs):
             if closed >= n:
@@ -616,10 +707,10 @@ class KTwoLot60Engine:
         pos = self.position
         if not pos:
             return []
-        
+
         commission = LOTS * COMMISSION_CENTS
         net = pos.gross_pnl_cents - commission
-        
+
         summary = TradeSummary(
             date=self.session_date or ts.astimezone(EASTERN).date().isoformat(),
             entry_time=pos.entry_time.isoformat() if pos.entry_time else "",
@@ -629,20 +720,25 @@ class KTwoLot60Engine:
             gross_pnl=pos.gross_pnl_cents / 100.0,
             commission=commission / 100.0,
             net_pnl=net / 100.0,
-            exit_reasons=[{
-                "leg": i,
-                "kind": leg.kind,
-                "price": leg.filled_price / 4.0 if leg.filled_price else 0,
-                "time": leg.filled_time.isoformat() if leg.filled_time else ""
-            } for i, leg in enumerate(pos.legs)]
+            exit_reasons=[
+                {
+                    "leg": i,
+                    "kind": leg.kind,
+                    "price": leg.filled_price / 4.0 if leg.filled_price else 0,
+                    "time": (
+                        leg.filled_time.isoformat() if leg.filled_time else ""
+                    ),
+                }
+                for i, leg in enumerate(pos.legs)
+            ],
         )
-        
+
         self.daily_trades.append(summary)
         self.daily_realized_cents += net
 
         return [{
             "action": "trade_summary",
-            "data": asdict(summary)
+            "data": asdict(summary),
         }]
 
     def get_status(self) -> dict:
@@ -657,11 +753,15 @@ class KTwoLot60Engine:
         if self.state == State.ARMED_SHORT and self.profile.vah:
             trigger = self.profile.vah / 4.0
             trigger_side = "short"
-            poc_dist_ok = abs(self.profile.poc - self.profile.vah) >= MIN_POC_DIST
+            poc_dist_ok = abs(self.profile.poc - self.profile.vah) >= (
+                MIN_POC_DIST
+            )
         elif self.state == State.ARMED_LONG and self.profile.val:
             trigger = self.profile.val / 4.0
             trigger_side = "long"
-            poc_dist_ok = abs(self.profile.poc - self.profile.val) >= MIN_POC_DIST
+            poc_dist_ok = abs(self.profile.poc - self.profile.val) >= (
+                MIN_POC_DIST
+            )
 
         armed = self.state in (State.ARMED_SHORT, State.ARMED_LONG)
         can_enter = bool(
@@ -672,13 +772,26 @@ class KTwoLot60Engine:
             and poc_dist_ok
         )
 
+        last_ticks = (
+            self.mark_price if self.mark_price is not None else self.prev_price
+        )
+
         return {
             "state": self.state.value,
-            "in_position": self.position is not None and self.position.direction != 0,
-            "direction": "long" if self.position and self.position.direction == 1 else
-                        "short" if self.position and self.position.direction == -1 else "flat",
-            "entry_price": self.position.entry_price / 4.0 if self.position else 0,
-            "last_price": self.prev_price / 4.0 if self.prev_price is not None else None,
+            "in_position": (
+                self.position is not None and self.position.direction != 0
+            ),
+            "direction": (
+                "long"
+                if self.position and self.position.direction == 1
+                else "short"
+                if self.position and self.position.direction == -1
+                else "flat"
+            ),
+            "entry_price": (
+                self.position.entry_price / 4.0 if self.position else 0
+            ),
+            "last_price": last_ticks / 4.0 if last_ticks is not None else None,
             "unrealized_pnl": unrealized / 100.0,
             "daily_pnl": daily_pnl / 100.0,
             "realized_pnl": self.daily_realized_cents / 100.0,
@@ -697,13 +810,15 @@ class KTwoLot60Engine:
             "profile": {
                 "poc": self.profile.poc / 4.0,
                 "vah": self.profile.vah / 4.0,
-                "val": self.profile.val / 4.0
-            } if self.profile.poc else None,
+                "val": self.profile.val / 4.0,
+            }
+            if self.profile.poc
+            else None,
             "trade_levels": self._trade_levels(),
         }
 
     def _trade_levels(self) -> Optional[dict]:
-        """Active entry / TP / stop levels for the open position (price units)."""
+        """Active entry / TP / stop levels for the open position."""
         pos = self.position
         if not pos or pos.direction == 0:
             return None
@@ -744,7 +859,7 @@ class KTwoLot60Engine:
 
 # ============================================================================
 # TopstepX / ProjectX Gateway API Client
-# Docs: https://gateway.docs.projectx.com/  |  https://api.topstepx.com/swagger/index.html
+# Docs: https://gateway.docs.projectx.com/
 # ============================================================================
 
 class TopstepClient:
@@ -768,25 +883,61 @@ class TopstepClient:
         self.api_key = api_key
         self.account_id = account_id
         self.token: Optional[str] = None
-        self.client = httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=30.0)
+        self.client = httpx.AsyncClient(
+            base_url=base_url.rstrip("/"), timeout=30.0
+        )
 
     def _headers(self) -> dict:
         if not self.token:
-            raise RuntimeError("Not authenticated — call authenticate() first")
+            raise TopstepAuthError(
+                "Not authenticated — call authenticate() first"
+            )
         return {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
             "accept": "text/plain",
         }
 
+    async def _post(
+        self,
+        path: str,
+        payload: Optional[dict] = None,
+        auth: bool = True,
+    ) -> dict:
+        headers = self._headers() if auth else None
+        kwargs: dict = {}
+        if headers is not None:
+            kwargs["headers"] = headers
+        if payload is not None:
+            kwargs["json"] = payload
+
+        response = await self.client.post(path, **kwargs)
+        if response.status_code in (401, 403):
+            raise TopstepAuthError(
+                f"HTTP {response.status_code} on {path}"
+            )
+        if response.status_code >= 400:
+            snippet = response.text[:200] if response.text else ""
+            raise RuntimeError(
+                f"HTTP {response.status_code} on {path}: {snippet}"
+            )
+        try:
+            return response.json()
+        except ValueError as e:
+            snippet = response.text[:200] if response.text else ""
+            raise RuntimeError(
+                f"Invalid JSON from {path} (HTTP {response.status_code}): "
+                f"{snippet}"
+            ) from e
+
     async def authenticate(self) -> bool:
         """POST /api/Auth/loginKey — returns a JWT valid ~24h."""
         try:
-            response = await self.client.post(
+            data = await self._post(
                 "/api/Auth/loginKey",
-                json={"userName": self.user_name, "apiKey": self.api_key},
+                payload={"userName": self.user_name, "apiKey": self.api_key},
+                auth=False,
             )
-            data = response.json()
             if not data.get("success") or not data.get("token"):
                 print(
                     f"Auth failed: errorCode={data.get('errorCode')} "
@@ -799,10 +950,17 @@ class TopstepClient:
             if self.account_id is None:
                 accounts = await self.search_accounts(only_active=True)
                 tradeable = [a for a in accounts if a.get("canTrade", True)]
-                chosen = tradeable[0] if tradeable else (accounts[0] if accounts else None)
+                chosen = (
+                    tradeable[0]
+                    if tradeable
+                    else (accounts[0] if accounts else None)
+                )
                 if chosen:
                     self.account_id = chosen["id"]
-                    print(f"Using Topstep account {self.account_id} ({chosen.get('name')})")
+                    print(
+                        f"Using Topstep account {self.account_id} "
+                        f"({chosen.get('name')})"
+                    )
                 else:
                     print("Auth ok but no accounts found")
                     return False
@@ -813,36 +971,32 @@ class TopstepClient:
 
     async def validate_session(self) -> bool:
         """POST /api/Auth/validate — refresh token before 24h expiry."""
-        response = await self.client.post("/api/Auth/validate", headers=self._headers())
-        if response.status_code in (401, 403):
+        try:
+            data = await self._post("/api/Auth/validate")
+        except TopstepAuthError:
             return False
-        data = response.json()
         if data.get("success") and data.get("newToken"):
             self.token = data["newToken"]
             return True
         return bool(data.get("success"))
 
     async def session_healthy(self) -> bool:
-        """Cheap auth probe: validate, then a light authenticated call."""
+        """Cheap auth probe using token validation."""
         try:
-            if not await self.validate_session():
-                return False
-            # Confirm the token still authorizes account APIs
-            await self.search_accounts(only_active=True)
-            return True
+            return await self.validate_session()
         except Exception:
             return False
 
     async def search_accounts(self, only_active: bool = True) -> list[dict]:
         """POST /api/Account/search"""
-        response = await self.client.post(
+        data = await self._post(
             "/api/Account/search",
-            headers=self._headers(),
-            json={"onlyActiveAccounts": only_active},
+            payload={"onlyActiveAccounts": only_active},
         )
-        data = response.json()
         if not data.get("success"):
-            raise RuntimeError(data.get("errorMessage") or "Account search failed")
+            raise RuntimeError(
+                data.get("errorMessage") or "Account search failed"
+            )
         return data.get("accounts") or []
 
     async def get_account(self) -> dict:
@@ -856,14 +1010,14 @@ class TopstepClient:
         """POST /api/Position/searchOpen"""
         if self.account_id is None:
             raise RuntimeError("account_id is required")
-        response = await self.client.post(
+        data = await self._post(
             "/api/Position/searchOpen",
-            headers=self._headers(),
-            json={"accountId": self.account_id},
+            payload={"accountId": self.account_id},
         )
-        data = response.json()
         if not data.get("success"):
-            raise RuntimeError(data.get("errorMessage") or "Position search failed")
+            raise RuntimeError(
+                data.get("errorMessage") or "Position search failed"
+            )
         return data.get("positions") or []
 
     async def search_trades(
@@ -880,28 +1034,25 @@ class TopstepClient:
         }
         if end_timestamp is not None:
             payload["endTimestamp"] = end_timestamp.isoformat()
-        response = await self.client.post(
-            "/api/Trade/search",
-            headers=self._headers(),
-            json=payload,
-        )
-        data = response.json()
+        data = await self._post("/api/Trade/search", payload=payload)
         if not data.get("success"):
-            raise RuntimeError(data.get("errorMessage") or "Trade search failed")
+            raise RuntimeError(
+                data.get("errorMessage") or "Trade search failed"
+            )
         return data.get("trades") or []
 
     async def search_open_orders(self) -> list[dict]:
         """POST /api/Order/searchOpen"""
         if self.account_id is None:
             raise RuntimeError("account_id is required")
-        response = await self.client.post(
+        data = await self._post(
             "/api/Order/searchOpen",
-            headers=self._headers(),
-            json={"accountId": self.account_id},
+            payload={"accountId": self.account_id},
         )
-        data = response.json()
         if not data.get("success"):
-            raise RuntimeError(data.get("errorMessage") or "Open order search failed")
+            raise RuntimeError(
+                data.get("errorMessage") or "Open order search failed"
+            )
         return data.get("orders") or []
 
     async def place_order(
@@ -926,21 +1077,14 @@ class TopstepClient:
             "trailPrice": None,
             "customTag": custom_tag,
         }
-        response = await self.client.post(
-            "/api/Order/place",
-            headers=self._headers(),
-            json=payload,
-        )
-        return response.json()
+        return await self._post("/api/Order/place", payload=payload)
 
     async def cancel_order(self, order_id: int) -> dict:
         """POST /api/Order/cancel"""
-        response = await self.client.post(
+        return await self._post(
             "/api/Order/cancel",
-            headers=self._headers(),
-            json={"accountId": self.account_id, "orderId": order_id},
+            payload={"accountId": self.account_id, "orderId": order_id},
         )
-        return response.json()
 
     async def modify_order(
         self,
@@ -958,14 +1102,11 @@ class TopstepClient:
             "stopPrice": stop_price,
             "trailPrice": None,
         }
-        response = await self.client.post(
-            "/api/Order/modify",
-            headers=self._headers(),
-            json=payload,
-        )
-        return response.json()
+        return await self._post("/api/Order/modify", payload=payload)
 
-    async def cancel_open_orders(self, contract_id: Optional[str] = None) -> list[dict]:
+    async def cancel_open_orders(
+        self, contract_id: Optional[str] = None
+    ) -> list[dict]:
         """Cancel all open orders, optionally filtered to one contract."""
         cancelled = []
         for order in await self.search_open_orders():
@@ -984,7 +1125,7 @@ class TopstepClient:
         direction: str,
         legs: list[dict],
     ) -> dict:
-        """Place TP1 limit (1), runner limit (1), and stop (2) after entry."""
+        """Place stop (2), TP1 limit (1), and runner limit (1) after entry."""
         if len(legs) < 2:
             raise RuntimeError("Exit brackets require tp1 and runner legs")
 
@@ -993,6 +1134,15 @@ class TopstepClient:
         opp_px = legs[1]["target"] / 4.0
         stop_px = legs[0]["stop"] / 4.0
 
+        # Place protective stop first
+        stop = await self.place_order(
+            contract_id=contract_id,
+            side=exit_side,
+            size=LOTS,
+            order_type=self.ORDER_TYPE_STOP,
+            stop_price=stop_px,
+            custom_tag=f"stop-{uuid.uuid4().hex[:10]}",
+        )
         tp1 = await self.place_order(
             contract_id=contract_id,
             side=exit_side,
@@ -1009,14 +1159,6 @@ class TopstepClient:
             limit_price=opp_px,
             custom_tag=f"opp-{uuid.uuid4().hex[:10]}",
         )
-        stop = await self.place_order(
-            contract_id=contract_id,
-            side=exit_side,
-            size=LOTS,
-            order_type=self.ORDER_TYPE_STOP,
-            stop_price=stop_px,
-            custom_tag=f"stop-{uuid.uuid4().hex[:10]}",
-        )
         return {
             "tp1": tp1,
             "opp": opp,
@@ -1026,38 +1168,37 @@ class TopstepClient:
 
     async def close_contract(self, contract_id: str) -> dict:
         """POST /api/Position/closeContract — flatten one contract."""
-        response = await self.client.post(
+        return await self._post(
             "/api/Position/closeContract",
-            headers=self._headers(),
-            json={"accountId": self.account_id, "contractId": contract_id},
+            payload={
+                "accountId": self.account_id,
+                "contractId": contract_id,
+            },
         )
-        return response.json()
 
     async def partial_close_contract(self, contract_id: str, size: int) -> dict:
         """POST /api/Position/partialCloseContract"""
-        response = await self.client.post(
+        return await self._post(
             "/api/Position/partialCloseContract",
-            headers=self._headers(),
-            json={
+            payload={
                 "accountId": self.account_id,
                 "contractId": contract_id,
                 "size": size,
             },
         )
-        return response.json()
 
     async def search_contracts(
         self, search_text: str, live: bool = False
     ) -> list[dict]:
         """POST /api/Contract/search"""
-        response = await self.client.post(
+        data = await self._post(
             "/api/Contract/search",
-            headers=self._headers(),
-            json={"searchText": search_text, "live": live},
+            payload={"searchText": search_text, "live": live},
         )
-        data = response.json()
         if not data.get("success"):
-            raise RuntimeError(data.get("errorMessage") or "Contract search failed")
+            raise RuntimeError(
+                data.get("errorMessage") or "Contract search failed"
+            )
         return data.get("contracts") or []
 
     async def retrieve_bars(
@@ -1074,10 +1215,9 @@ class TopstepClient:
         """POST /api/History/retrieveBars (max 20,000 bars per request)."""
         if live is None:
             live = TOPSTEP_CONTRACT_LIVE
-        response = await self.client.post(
+        data = await self._post(
             "/api/History/retrieveBars",
-            headers=self._headers(),
-            json={
+            payload={
                 "contractId": contract_id,
                 "live": live,
                 "startTime": start_time.isoformat(),
@@ -1088,7 +1228,6 @@ class TopstepClient:
                 "includePartialBar": include_partial_bar,
             },
         )
-        data = response.json()
         if not data.get("success"):
             raise RuntimeError(
                 data.get("errorMessage")
@@ -1104,12 +1243,10 @@ class TopstepClient:
     ) -> dict:
         """Resolve an explicit contract id or the active front-month match."""
         if contract_id:
-            response = await self.client.post(
+            data = await self._post(
                 "/api/Contract/searchById",
-                headers=self._headers(),
-                json={"contractId": contract_id},
+                payload={"contractId": contract_id},
             )
-            data = response.json()
             if data.get("success") and data.get("contract"):
                 return data["contract"]
             raise RuntimeError(f"Contract not found: {contract_id}")
@@ -1141,7 +1278,7 @@ class TopstepClient:
     async def execute_strategy_action(
         self, action: dict, contract_id: str, enable_orders: bool = True
     ) -> Optional[dict]:
-        """Map engine enter/exit actions onto Topstep order/position endpoints."""
+        """Map engine enter/exit actions onto Topstep endpoints."""
         kind = action.get("action")
         if kind not in ("enter", "exit"):
             return None
@@ -1178,10 +1315,6 @@ class TopstepClient:
 
         result = await self.partial_close_contract(contract_id, size=size)
         if not result.get("success"):
-            # Fall back to opposite-side market order
-            direction = action.get("direction")
-            # Engine exit actions don't always include direction; infer from side needed
-            # Prefer closeContract as last resort
             fallback = await self.close_contract(contract_id)
             return {
                 "action": "exit",
@@ -1216,7 +1349,9 @@ class TopstepClient:
             })
 
         return {
-            "success": all(r.get("success", False) for r in closed) if closed else True,
+            "success": (
+                all(r.get("success", False) for r in closed) if closed else True
+            ),
             "accountId": self.account_id,
             "cancelledOrders": cancelled,
             "closedPositions": closed,
@@ -1282,7 +1417,9 @@ def list_sessions(sessions_dir: Path = SESSIONS_DIR) -> list[dict]:
     return sessions
 
 
-def resolve_session_file(session_date: str, sessions_dir: Path = SESSIONS_DIR) -> Path:
+def resolve_session_file(
+    session_date: str, sessions_dir: Path = SESSIONS_DIR
+) -> Path:
     """Resolve a session date to its .npy path."""
     for row in list_sessions(sessions_dir):
         if row["date"] == session_date:
@@ -1369,6 +1506,23 @@ class ConnectionManager:
         for connection in dead:
             self.disconnect(connection)
 
+    async def _replace_topstep_client(self) -> TopstepClient:
+        """Close any prior TopstepClient and create a fresh one."""
+        if self.topstep is not None:
+            try:
+                await self.topstep.close()
+            except Exception:
+                pass
+            self.topstep = None
+
+        self.topstep = TopstepClient(
+            user_name=TOPSTEP_USERNAME,
+            api_key=TOPSTEP_API_KEY,
+            base_url=TOPSTEP_BASE_URL,
+            account_id=TOPSTEP_ACCOUNT_ID,
+        )
+        return self.topstep
+
     async def start_strategy(
         self,
         mode: str = "test",
@@ -1386,8 +1540,7 @@ class ConnectionManager:
         if mode == "replay" and not session_date:
             raise ValueError("session_date is required for replay mode")
 
-        self.stop()
-        await asyncio.sleep(0)  # let prior loop observe running=False
+        await self.stop_async()
 
         self.diag = LiveDiagLog() if mode == "live" else None
         log_path = None
@@ -1410,15 +1563,11 @@ class ConnectionManager:
             if not TOPSTEP_USERNAME or not TOPSTEP_API_KEY:
                 self.running = False
                 raise RuntimeError(
-                    "Live mode requires TOPSTEP_USERNAME and TOPSTEP_API_KEY in .env"
+                    "Live mode requires TOPSTEP_USERNAME and TOPSTEP_API_KEY "
+                    "in .env"
                 )
-            self.topstep = TopstepClient(
-                user_name=TOPSTEP_USERNAME,
-                api_key=TOPSTEP_API_KEY,
-                base_url=TOPSTEP_BASE_URL,
-                account_id=TOPSTEP_ACCOUNT_ID,
-            )
-            ok = await self.topstep.authenticate()
+            client = await self._replace_topstep_client()
+            ok = await client.authenticate()
             if not ok:
                 self.running = False
                 raise RuntimeError("TopstepX authentication failed")
@@ -1428,23 +1577,18 @@ class ConnectionManager:
         )
 
     async def ensure_topstep(self) -> TopstepClient:
-        """Authenticate a Topstep client even when the strategy is not running live."""
+        """Authenticate a Topstep client even when not running live."""
         if self.topstep and self.topstep.token:
             return self.topstep
         if not TOPSTEP_USERNAME or not TOPSTEP_API_KEY:
             raise RuntimeError(
                 "TOPSTEP_USERNAME and TOPSTEP_API_KEY are required in .env"
             )
-        self.topstep = TopstepClient(
-            user_name=TOPSTEP_USERNAME,
-            api_key=TOPSTEP_API_KEY,
-            base_url=TOPSTEP_BASE_URL,
-            account_id=TOPSTEP_ACCOUNT_ID,
-        )
-        ok = await self.topstep.authenticate()
+        client = await self._replace_topstep_client()
+        ok = await client.authenticate()
         if not ok:
             raise RuntimeError("TopstepX authentication failed")
-        return self.topstep
+        return client
 
     def _engine_status_with_broker(self) -> Optional[dict]:
         if not self.engine:
@@ -1459,8 +1603,10 @@ class ConnectionManager:
         }
         return status
 
-    async def cancel_working_and_open_orders(self, reason: str = "cleanup") -> list[dict]:
-        """Cancel tracked exit orders and any other open orders on the contract."""
+    async def cancel_working_and_open_orders(
+        self, reason: str = "cleanup"
+    ) -> list[dict]:
+        """Cancel tracked exit orders and any other open orders on contract."""
         if not self.topstep:
             return []
         cancelled = []
@@ -1478,17 +1624,32 @@ class ConnectionManager:
             )
         return cancelled
 
-    async def place_live_exit_brackets(self, enter_action: dict) -> Optional[dict]:
-        """After a filled entry, rest TP1 + runner limits and a 2-lot stop."""
+    async def place_live_exit_brackets(
+        self, enter_action: dict
+    ) -> Optional[dict]:
+        """After a filled entry, rest stop + TP1 + runner limits."""
         if not self.topstep or not self.contract_id:
             return None
         if not TOPSTEP_ENABLE_ORDERS:
             return {"skipped": True, "reason": "TOPSTEP_ENABLE_ORDERS=false"}
 
+        legs = enter_action.get("legs") or []
+
+        # Re-anchor targets/stop to actual broker fill price if available
+        try:
+            pos = await self._broker_position_for_contract()
+            if pos and pos.get("averagePrice") is not None and self.engine:
+                fill_ticks = price_to_ticks(float(pos["averagePrice"]))
+                updated_legs = self.engine.sync_entry_fill_price(fill_ticks)
+                if updated_legs:
+                    legs = updated_legs
+        except Exception:
+            pass
+
         brackets = await self.topstep.place_exit_brackets(
             contract_id=self.contract_id,
             direction=enter_action.get("direction") or "long",
-            legs=enter_action.get("legs") or [],
+            legs=legs,
         )
         self.working_exits = {
             "tp1": self._order_id_from_result(brackets.get("tp1")),
@@ -1503,12 +1664,46 @@ class ConnectionManager:
                 stop=self.working_exits["stop"],
                 prices=brackets.get("prices"),
             )
-        await self.broadcast({"type": "broker", "data": {"action": "brackets", **brackets}})
+        await self.broadcast({
+            "type": "broker",
+            "data": {"action": "brackets", **brackets},
+        })
+
+        # Never leave a live position open without a working stop-loss
+        if self.working_exits["stop"] is None:
+            if self.diag:
+                self.diag.info(
+                    "stop_placement_failed",
+                    stop_result=brackets.get("stop"),
+                )
+            await self.broadcast({
+                "type": "status",
+                "message": (
+                    "CRITICAL: Stop-loss order failed — flattening position"
+                ),
+            })
+            await self.cancel_working_and_open_orders(
+                reason="stop_placement_failed"
+            )
+            await self.topstep.close_contract(self.contract_id)
+            if self.engine and self.engine.position:
+                mark = (
+                    self.engine.mark_price
+                    or self.engine.prev_price
+                    or self.engine.position.entry_price
+                )
+                actions = self.engine._close_all(
+                    "stop_placement_failed", mark, datetime.now(EASTERN)
+                )
+                for act in actions:
+                    await self.broadcast({"type": "action", "data": act})
+            return brackets
+
         return brackets
 
-    async def on_tp1_filled_broker(self):
-        """After TP1, shrink the stop to 1 lot and drop the TP1 order id."""
-        self.working_exits["tp1"] = None
+    async def on_single_leg_filled_broker(self, leg_key: str = "tp1"):
+        """After one leg closes, shrink stop to 1 lot and drop its order id."""
+        self.working_exits[leg_key] = None
         stop_id = self.working_exits.get("stop")
         if not stop_id or not self.topstep or not TOPSTEP_ENABLE_ORDERS:
             return
@@ -1565,9 +1760,16 @@ class ConnectionManager:
             "status": status,
             "broker": broker,
         })
-        return {"success": True, "price": price, "status": status, "broker": broker}
+        return {
+            "success": True,
+            "price": price,
+            "status": status,
+            "broker": broker,
+        }
 
-    def _set_topstep_session(self, state: str, message: str = None, reason: str = None):
+    def _set_topstep_session(
+        self, state: str, message: str = None, reason: str = None
+    ):
         self.topstep_session = {
             "state": state,
             "message": message,
@@ -1575,7 +1777,9 @@ class ConnectionManager:
             "updated_at": datetime.now(EASTERN).isoformat(),
         }
 
-    async def _broadcast_session(self, state: str, message: str, reason: str = None):
+    async def _broadcast_session(
+        self, state: str, message: str, reason: str = None
+    ):
         self._set_topstep_session(state, message=message, reason=reason)
         await self.broadcast({
             "type": "session",
@@ -1593,6 +1797,8 @@ class ConnectionManager:
             )
 
     def _looks_like_auth_failure(self, err) -> bool:
+        if isinstance(err, TopstepAuthError):
+            return True
         text = str(err).lower()
         needles = (
             "401",
@@ -1634,7 +1840,7 @@ class ConnectionManager:
         await asyncio.to_thread(self.market_hub.start)
 
     async def reclaim_topstep_session(self, reason: str) -> bool:
-        """Re-login via loginKey and restart the market hub after a stolen session."""
+        """Re-login via loginKey and restart the market hub."""
         if self.mode != "live" or not self.topstep:
             return False
         loop = asyncio.get_running_loop()
@@ -1686,7 +1892,7 @@ class ConnectionManager:
             self._reclaiming_session = False
 
     async def handle_hub_lost(self, reason: str):
-        """Market hub dropped — restart if auth is fine, otherwise full reclaim."""
+        """Market hub dropped — restart if auth ok, else full reclaim."""
         if self.mode != "live" or not self.topstep or self._reclaiming_session:
             return
         healthy = await self.topstep.session_healthy()
@@ -1700,12 +1906,14 @@ class ConnectionManager:
                 })
                 self._set_topstep_session("ok", message="Topstep session ok")
             except Exception as e:
-                await self.reclaim_topstep_session(reason=f"hub_restart_failed:{e}")
+                await self.reclaim_topstep_session(
+                    reason=f"hub_restart_failed:{e}"
+                )
             return
         await self.reclaim_topstep_session(reason=reason)
 
     async def ensure_topstep_session(self, reason: str = "health") -> bool:
-        """Probe auth health; reclaim automatically if the session was stolen."""
+        """Probe auth health; reclaim automatically if session was stolen."""
         if self.mode != "live" or not self.topstep:
             return True
         if self._reclaiming_session:
@@ -1742,11 +1950,13 @@ class ConnectionManager:
         signed = _broker_signed_size(match)
         abs_size = abs(signed)
         ts = datetime.now(EASTERN)
-        mark = (
-            self.engine.prev_price
-            if self.engine and self.engine.prev_price is not None
-            else None
-        )
+        mark = None
+        if self.engine:
+            mark = (
+                self.engine.mark_price
+                if self.engine.mark_price is not None
+                else self.engine.prev_price
+            )
         if mark is None and match and match.get("averagePrice") is not None:
             mark = price_to_ticks(float(match["averagePrice"]))
         if mark is None:
@@ -1770,7 +1980,9 @@ class ConnectionManager:
             desync = True
             # Drop any resting TP/stop orders left behind
             try:
-                await self.cancel_working_and_open_orders(reason="external_flat")
+                await self.cancel_working_and_open_orders(
+                    reason="external_flat"
+                )
             except Exception:
                 pass
         elif self.engine and engine_legs > 0 and abs_size > 0:
@@ -1789,7 +2001,7 @@ class ConnectionManager:
                 desync = True
                 # Likely TP1 fill at broker — resize stop to remaining size
                 if abs_size == 1:
-                    await self.on_tp1_filled_broker()
+                    await self.on_single_leg_filled_broker("tp1")
             elif abs_size > engine_legs:
                 note = "broker_larger_than_engine"
                 desync = True
@@ -1829,7 +2041,6 @@ class ConnectionManager:
             await self.broadcast({"type": "action", "data": action})
 
         status = self._engine_status_with_broker()
-        # Quiet on routine polls unless something changed / looked wrong
         notify = reason != "poll" or desync or bool(reconciled)
         if status and notify:
             await self.broadcast({
@@ -1852,15 +2063,25 @@ class ConnectionManager:
         }
 
     async def close_all_positions(self, price: Optional[int] = None) -> dict:
-        """Flatten broker positions (live) and/or local engine position (sim)."""
+        """Flatten broker positions (live) and/or local engine position."""
         result = {
             "engine": None,
             "broker": None,
         }
 
-        if self.engine and self.engine.position and self.engine.position.direction != 0:
-            fill_price = price if price is not None else (
-                self.engine.prev_price or self.engine.position.entry_price
+        if (
+            self.engine
+            and self.engine.position
+            and self.engine.position.direction != 0
+        ):
+            fill_price = (
+                price
+                if price is not None
+                else (
+                    self.engine.mark_price
+                    or self.engine.prev_price
+                    or self.engine.position.entry_price
+                )
             )
             ts = datetime.now(EASTERN)
             actions = self.engine._close_all("manual_close", fill_price, ts)
@@ -1878,7 +2099,7 @@ class ConnectionManager:
                 "status": self._engine_status_with_broker(),
             })
 
-        # Broker flatten only in live mode (replay/test stay local-engine only).
+        # Broker flatten only in live mode (replay/test stay local-engine only)
         if self.mode == "live" and TOPSTEP_USERNAME and TOPSTEP_API_KEY:
             try:
                 client = await self.ensure_topstep()
@@ -1898,7 +2119,9 @@ class ConnectionManager:
                 and not result["broker"].get("error")
             )
         )
-        engine_ok = result["engine"] is None or result["engine"].get("success", False)
+        engine_ok = result["engine"] is None or result["engine"].get(
+            "success", False
+        )
         result["success"] = broker_ok and engine_ok
         if result.get("engine") and self.engine:
             result["engine"]["status"] = self._engine_status_with_broker()
@@ -1918,6 +2141,8 @@ class ConnectionManager:
                 await self._replay_data_loop(session_date, speed)
             else:
                 await self._live_data_loop()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             await self.broadcast({
                 "type": "status",
@@ -1932,9 +2157,9 @@ class ConnectionManager:
         base_price = 85000  # ~21250.00 in MNQ points (ticks * 0.25)
         self.engine.update_profile(
             poc=base_price,
-            vah=base_price + 80,
-            val=base_price - 80,
-            timestamp=datetime.now(EASTERN),
+            vah=base_price + 160,  # >= MIN_POC_DIST (120)
+            val=base_price - 160,
+            ts=datetime.now(EASTERN),
         )
 
         price = base_price
@@ -1949,14 +2174,14 @@ class ConnectionManager:
             for action in actions:
                 await self.broadcast({
                     "type": "action",
-                    "data": action
+                    "data": action,
                 })
 
             await self.broadcast({
                 "type": "tick",
                 "price": price / 4.0,
                 "timestamp": ts.isoformat(),
-                "status": self.engine.get_status()
+                "status": self.engine.get_status(),
             })
 
             await asyncio.sleep(0.1)
@@ -1968,7 +2193,7 @@ class ConnectionManager:
     ):
         """Replay a historical RTH session from output/sessions/*.npy."""
         path = resolve_session_file(session_date)
-        data = np.load(path)
+        data = await asyncio.to_thread(np.load, path)
 
         prices = np.ascontiguousarray(data["last"], dtype=np.int32)
         stamps = np.ascontiguousarray(data["ts_100ns"], dtype=np.int64)
@@ -1989,7 +2214,11 @@ class ConnectionManager:
             rth_profile_for_session, prices, sizes, stamps
         )
 
-        speed_key = str(speed).lower() if not isinstance(speed, (int, float)) else None
+        speed_key = (
+            str(speed).lower()
+            if not isinstance(speed, (int, float))
+            else None
+        )
         if speed_key in REPLAY_SPEEDS:
             speed_factor = REPLAY_SPEEDS[speed_key]
         else:
@@ -2004,10 +2233,12 @@ class ConnectionManager:
             "type": "status",
             "message": (
                 f"Replaying {session_date} at "
-                f"{'max' if speed_factor is None else f'{speed_factor:g}x'} speed"
+                f"{'max' if speed_factor is None else f'{speed_factor:g}x'} "
+                f"speed"
             ),
         })
 
+        loop = asyncio.get_running_loop()
         last_progress_pct = -1
         last_ui_broadcast = 0.0
         ui_interval = 0.05  # ~20 chart updates/sec max
@@ -2033,7 +2264,7 @@ class ConnectionManager:
             for action in actions:
                 await self.broadcast({"type": "action", "data": action})
 
-            now = asyncio.get_event_loop().time()
+            now = loop.time()
             should_push_tick = (
                 actions
                 or i == 0
@@ -2066,7 +2297,7 @@ class ConnectionManager:
                 delta_ns = int(stamps[i + 1]) - int(stamps[i])
                 if delta_ns > 0:
                     sleep_s = (delta_ns / NS_PER_SEC) / speed_factor
-                    # Cap pathological gaps (halts) so replay doesn't stall forever
+                    # Cap pathological gaps (halts) so replay doesn't stall
                     sleep_s = min(sleep_s, 0.5)
                     if sleep_s > 0.0005:
                         await asyncio.sleep(sleep_s)
@@ -2092,15 +2323,17 @@ class ConnectionManager:
             })
         self.running = False
 
-    async def _broker_signed_for_contract(self) -> int:
+    async def _broker_position_for_contract(self) -> Optional[dict]:
         if not self.topstep or not self.contract_id:
-            return 0
+            return None
         positions = await self.topstep.search_open_positions()
-        match = next(
+        return next(
             (p for p in positions if p.get("contractId") == self.contract_id),
             None,
         )
-        return _broker_signed_size(match)
+
+    async def _broker_signed_for_contract(self) -> int:
+        return _broker_signed_size(await self._broker_position_for_contract())
 
     async def _execute_live_actions(self, actions: list[dict]):
         """Broadcast engine actions and optionally place broker orders."""
@@ -2133,17 +2366,33 @@ class ConnectionManager:
                     if self.diag:
                         self.diag.info("broker", **_flatten_broker_log(result))
                     broker = result.get("broker") or {}
-                    if broker.get("success") is not False and not result.get("skipped"):
+                    if broker.get("success") is False:
+                        # Roll back engine position so we don't log a fake trade
+                        if self.engine:
+                            self.engine.abort_unfilled_entry(
+                                ts=datetime.now(EASTERN)
+                            )
+                        await self.broadcast({
+                            "type": "status",
+                            "message": (
+                                "Broker entry rejected — rolled back local "
+                                "position"
+                            ),
+                        })
+                    elif not result.get("skipped"):
                         try:
                             await self.place_live_exit_brackets(action)
                         except Exception as bracket_err:
                             if self.diag:
                                 self.diag.info(
-                                    "exit_brackets_error", error=str(bracket_err)
+                                    "exit_brackets_error",
+                                    error=str(bracket_err),
                                 )
                             await self.broadcast({
                                 "type": "status",
-                                "message": f"Exit brackets failed: {bracket_err}",
+                                "message": (
+                                    f"Exit brackets failed: {bracket_err}"
+                                ),
                             })
 
             if exits:
@@ -2156,18 +2405,12 @@ class ConnectionManager:
                     for a in exits
                 )
                 stop_exit = any(a.get("reason") == "stop" for a in exits)
-                tp1_exits = [
-                    a for a in exits
-                    if a.get("kind") == "tp1" or a.get("leg") == 0
-                ]
-                runner_exits = [
-                    a for a in exits
-                    if a.get("kind") == "opp" or a.get("leg") == 1
-                ]
 
-                if flatten or stop_exit or fully_flat or runner_exits:
-                    # Done with the trade (or protecting) — cancel resting exits
-                    await self.cancel_working_and_open_orders(reason="exit_flatten")
+                if flatten or stop_exit or fully_flat:
+                    # Done with the trade (or stopping out) — cancel exits
+                    await self.cancel_working_and_open_orders(
+                        reason="exit_flatten"
+                    )
                     signed = await self._broker_signed_for_contract()
                     if signed != 0:
                         result = await self.topstep.execute_strategy_action(
@@ -2176,22 +2419,33 @@ class ConnectionManager:
                             enable_orders=TOPSTEP_ENABLE_ORDERS,
                         )
                         if result:
-                            await self.broadcast({"type": "broker", "data": result})
+                            await self.broadcast({
+                                "type": "broker",
+                                "data": result,
+                            })
                             if self.diag:
-                                self.diag.info("broker", **_flatten_broker_log(result))
-                    # Cancel again in case close left orphans
-                    await self.cancel_working_and_open_orders(reason="post_flatten")
+                                self.diag.info(
+                                    "broker", **_flatten_broker_log(result)
+                                )
+                    await self.cancel_working_and_open_orders(
+                        reason="post_flatten"
+                    )
                 else:
-                    # TP1 only — leave runner limit; shrink stop to 1
-                    for action in tp1_exits:
-                        # Cancel the TP1 resting order if still open
-                        tp1_id = self.working_exits.get("tp1")
-                        if tp1_id and TOPSTEP_ENABLE_ORDERS:
+                    # Single leg target exit (TP1 or runner closed first)
+                    for action in exits:
+                        leg_key = (
+                            "opp"
+                            if action.get("kind") == "opp"
+                            or action.get("leg") == 1
+                            else "tp1"
+                        )
+                        order_id = self.working_exits.get(leg_key)
+                        if order_id and TOPSTEP_ENABLE_ORDERS:
                             try:
-                                await self.topstep.cancel_order(tp1_id)
+                                await self.topstep.cancel_order(order_id)
                             except Exception:
                                 pass
-                            self.working_exits["tp1"] = None
+                            self.working_exits[leg_key] = None
 
                         signed = await self._broker_signed_for_contract()
                         if abs(signed) >= 2:
@@ -2202,20 +2456,26 @@ class ConnectionManager:
                                 enable_orders=TOPSTEP_ENABLE_ORDERS,
                             )
                             if result:
-                                await self.broadcast({"type": "broker", "data": result})
+                                await self.broadcast({
+                                    "type": "broker",
+                                    "data": result,
+                                })
                                 if self.diag:
                                     self.diag.info(
-                                        "broker", **_flatten_broker_log(result)
+                                        "broker",
+                                        **_flatten_broker_log(result),
                                     )
                                 broker = result.get("broker") or {}
                                 if broker.get("success") is False:
                                     await self.sync_broker_position(
                                         reason="after_failed_exit"
                                     )
-                        await self.on_tp1_filled_broker()
+                        await self.on_single_leg_filled_broker(leg_key)
 
                 if fully_flat:
-                    await self.cancel_working_and_open_orders(reason="trade_done")
+                    await self.cancel_working_and_open_orders(
+                        reason="trade_done"
+                    )
 
         except Exception as e:
             if self.diag:
@@ -2224,12 +2484,17 @@ class ConnectionManager:
                 "type": "status",
                 "message": f"Broker action error: {e}",
             })
-            try:
-                await self.sync_broker_position(reason="after_broker_error")
-            except Exception:
-                pass
+            if self._looks_like_auth_failure(e):
+                await self.reclaim_topstep_session(reason=f"broker_action:{e}")
+            else:
+                try:
+                    await self.sync_broker_position(reason="after_broker_error")
+                except Exception:
+                    pass
 
-    async def _broadcast_live_tick(self, price: float, ts: datetime, force: bool = False):
+    async def _broadcast_live_tick(
+        self, price: float, ts: datetime, force: bool = False
+    ):
         if not self.engine:
             return
         now = asyncio.get_running_loop().time()
@@ -2249,14 +2514,18 @@ class ConnectionManager:
         if not trade or not self.engine:
             return
         # Ignore live prints until history seeding finishes
-        if not self.engine.entries_enabled and not getattr(self, "_live_seed_done", False):
+        if not self.engine.entries_enabled and not getattr(
+            self, "_live_seed_done", False
+        ):
             return
 
         self.value_area.maybe_roll_day(trade.timestamp)
         profile = self.value_area.add(trade.price_ticks, trade.volume)
         if profile:
             poc, vah, val = profile
-            self.engine.update_profile(poc=poc, vah=vah, val=val, ts=trade.timestamp)
+            self.engine.update_profile(
+                poc=poc, vah=vah, val=val, ts=trade.timestamp
+            )
 
         t = trade.timestamp.astimezone(EASTERN).time()
         is_rth = RTH_START <= t < RTH_END
@@ -2311,7 +2580,10 @@ class ConnectionManager:
                 # Fall back to 1-minute bars if second bars are unavailable
                 await self.broadcast({
                     "type": "status",
-                    "message": f"1s history failed ({e}); retrying with 1-minute bars…",
+                    "message": (
+                        f"1s history failed ({e}); retrying with 1-minute "
+                        "bars…"
+                    ),
                 })
                 bars = await self.topstep.retrieve_bars(
                     contract_id=contract_id,
@@ -2339,13 +2611,16 @@ class ConnectionManager:
             if last_close is not None:
                 px = price_to_ticks(last_close)
                 self.engine.prev_price = px
+                self.engine.mark_price = px
                 if px > poc:
                     self.engine.origin = 1
                 elif px < poc:
                     self.engine.origin = -1
                 else:
                     self.engine.origin = 0
-            await self._broadcast_live_tick(last_close or ticks_to_price(poc), ts, force=True)
+            await self._broadcast_live_tick(
+                last_close or ticks_to_price(poc), ts, force=True
+            )
 
         return {
             "seeded": used > 0,
@@ -2386,9 +2661,8 @@ class ConnectionManager:
             except ValueError:
                 pass
 
-        # Refresh mark for unrealized P&L only; do not drive entry crosses from quotes
-        if self.engine.position:
-            self.engine.prev_price = price_to_ticks(float(last))
+        # Refresh mark_price only; keep prev_price strictly for trade prints
+        self.engine.mark_price = price_to_ticks(float(last))
         await self._broadcast_live_tick(float(last), ts)
 
     async def _live_data_loop(self):
@@ -2424,7 +2698,7 @@ class ConnectionManager:
                 orders=TOPSTEP_ENABLE_ORDERS,
             )
 
-        # Rebuild today's VA before connecting the trade stream / allowing entries
+        # Rebuild today's VA before connecting trade stream / allowing entries
         try:
             seed = await self._seed_live_value_area(self.contract_id)
             await self.broadcast({
@@ -2456,7 +2730,9 @@ class ConnectionManager:
                 self.diag.info("va_seed_failed", error=str(e))
             await self.broadcast({
                 "type": "status",
-                "message": f"VA seed failed ({e}); continuing with live-only profile",
+                "message": (
+                    f"VA seed failed ({e}); continuing with live-only profile"
+                ),
             })
 
         self._live_seed_done = True
@@ -2484,7 +2760,9 @@ class ConnectionManager:
         await asyncio.to_thread(self.market_hub.start)
         self._last_session_health = loop.time()
         self._last_broker_sync = 0.0
-        await self._broadcast_session("ok", "Topstep session ok", reason="live_start")
+        await self._broadcast_session(
+            "ok", "Topstep session ok", reason="live_start"
+        )
         try:
             while self.running:
                 try:
@@ -2503,12 +2781,36 @@ class ConnectionManager:
                         })
                     elif kind == "hub_lost":
                         await self.handle_hub_lost(
-                            reason=str(event[1] if len(event) > 1 else "hub_lost")
+                            reason=str(
+                                event[1] if len(event) > 1 else "hub_lost"
+                            )
                         )
                     elif kind == "trade":
                         await self._process_live_trade(event[2])
                     elif kind == "quote":
                         await self._process_live_quote(event[2])
+
+                # Clock-based RTH close guard in case trade feed goes quiet
+                now_et = datetime.now(EASTERN)
+                is_rth_now = RTH_START <= now_et.time() < RTH_END
+                if (
+                    not is_rth_now
+                    and self.engine
+                    and self.engine.position
+                    and self.engine.position.direction != 0
+                ):
+                    mark = (
+                        self.engine.mark_price
+                        or self.engine.prev_price
+                        or self.engine.position.entry_price
+                    )
+                    actions = self.engine._close_all(
+                        "session_close", mark, now_et
+                    )
+                    await self._execute_live_actions(actions)
+                    await self._broadcast_live_tick(
+                        mark / 4.0, now_et, force=True
+                    )
 
                 now = loop.time()
                 if now - self._last_broker_sync >= BROKER_SYNC_INTERVAL_SEC:
@@ -2523,17 +2825,47 @@ class ConnectionManager:
                                 reason=f"broker_sync:{e}"
                             )
 
-                if now - self._last_session_health >= SESSION_HEALTH_INTERVAL_SEC:
+                if now - self._last_session_health >= (
+                    SESSION_HEALTH_INTERVAL_SEC
+                ):
                     await self.ensure_topstep_session(reason="health_poll")
         finally:
             if self.market_hub:
                 await asyncio.to_thread(self.market_hub.stop)
                 self.market_hub = None
 
-    def stop(self):
+    async def stop_async(self):
+        """Stop the active loop and market hub without blocking the loop."""
         if self.diag and self.running:
             self.diag.info("session_stop", mode=self.mode)
         self.running = False
+
+        task = self.replay_task
+        self.replay_task = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+        hub = self.market_hub
+        self.market_hub = None
+        if hub:
+            try:
+                await asyncio.to_thread(hub.stop)
+            except Exception:
+                pass
+
+    def stop(self):
+        """Synchronous stop helper."""
+        if self.diag and self.running:
+            self.diag.info("session_stop", mode=self.mode)
+        self.running = False
+        if self.replay_task and not self.replay_task.done():
+            self.replay_task.cancel()
         if self.market_hub:
             try:
                 self.market_hub.stop()
@@ -2552,9 +2884,10 @@ manager = ConnectionManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
-    manager.stop()
+    await manager.stop_async()
     if manager.topstep:
         await manager.topstep.close()
+
 
 app = FastAPI(lifespan=lifespan)
 
@@ -2574,7 +2907,7 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             data = await websocket.receive_json()
             cmd = data.get("command")
-            
+
             if cmd == "start":
                 mode = data.get("mode")
                 if mode is None:
@@ -2588,7 +2921,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     )
                     label = mode
                     if mode == "replay":
-                        label = f"replay {data.get('session_date')} @ {data.get('speed', 50)}x"
+                        label = (
+                            f"replay {data.get('session_date')} "
+                            f"@ {data.get('speed', 50)}x"
+                        )
                     await websocket.send_json({
                         "type": "status",
                         "message": f"Strategy started ({label})",
@@ -2601,26 +2937,26 @@ async def websocket_endpoint(websocket: WebSocket):
                     })
 
             elif cmd == "stop":
-                manager.stop()
+                await manager.stop_async()
                 await websocket.send_json({
                     "type": "status",
-                    "message": "Strategy stopped"
+                    "message": "Strategy stopped",
                 })
 
             elif cmd == "update_profile":
                 if manager.engine:
                     manager.engine.update_profile(
-                        poc=int(data["poc"] * 4),
-                        vah=int(data["vah"] * 4),
-                        val=int(data["val"] * 4),
-                        timestamp=datetime.fromisoformat(data["timestamp"])
+                        poc=price_to_ticks(float(data["poc"])),
+                        vah=price_to_ticks(float(data["vah"])),
+                        val=price_to_ticks(float(data["val"])),
+                        ts=datetime.fromisoformat(data["timestamp"]),
                     )
-                    
+
             elif cmd == "status":
                 if manager.engine:
                     await websocket.send_json({
                         "type": "status",
-                        "data": manager.engine.get_status()
+                        "data": manager._engine_status_with_broker(),
                     })
 
             elif cmd == "close_all":
@@ -2649,7 +2985,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         "status": result.get("status"),
                         "reconciled": result.get("reconciled_actions", 0),
                         "message": (
-                            f"Broker sync: {(result.get('broker') or {}).get('note', 'ok')}"
+                            "Broker sync: "
+                            f"{(result.get('broker') or {}).get('note', 'ok')}"
                         ),
                         "data": result,
                     })
@@ -2713,7 +3050,11 @@ async def get_positions():
     try:
         client = await manager.ensure_topstep()
         positions = await client.search_open_positions()
-        return {"success": True, "positions": positions, "accountId": client.account_id}
+        return {
+            "success": True,
+            "positions": positions,
+            "accountId": client.account_id,
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -2737,15 +3078,15 @@ async def close_all_positions():
 
 
 @app.post("/api/trade/runner-tp")
-async def update_runner_tp(payload: dict):
+async def update_runner_tp(payload: RunnerTPRequest):
     """Update runner take-profit price: {\"price\": 26350.25}."""
     try:
-        price = float(payload.get("price"))
-        return await manager.update_runner_tp(price)
+        return await manager.update_runner_tp(payload.price)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    uvicorn.run(app, host="127.0.0.1", port=8000)
