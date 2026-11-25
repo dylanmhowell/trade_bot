@@ -120,3 +120,7 @@ Replay reads session files under `output/sessions/` (see `manifest.json`). Those
 - Keep `.env` private; never commit API keys.
 - Start with **Test** / **Replay**, then Live with `TOPSTEP_ENABLE_ORDERS=false`, then enable orders on a practice account.
 - You are responsible for risk limits, contract month rolls, and prop-firm rules.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
