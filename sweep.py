@@ -78,6 +78,12 @@ class Variant:
     # >0 → must have been outside continuously for that long.
     vwap_sigma: float = 0.0
     vwap_persist_secs: int = 0
+    # Pull opp-VA runner target toward entry (ticks). Helps when price
+    # stalls just short of the far VA edge.
+    opp_pull_ticks: int = 0
+    # Move surviving stops to entry once price reaches the entry-time POC
+    # in the trade's favor (distinct from move_be, which fires on TP1 fill).
+    be_on_poc: bool = False
     family: str = "legacy"
     note: str = ""
 
@@ -188,6 +194,34 @@ VWAP_FILTER_VARIANTS = [
     _k60(name="TP1_40_vwap2_15m", tp1_ticks=160, vwap_sigma=2.0,
          vwap_persist_secs=900, family="vwap_filter",
          note="TP1 40pt; block while outside VWAP±2σ for ≥15 minutes"),
+]
+
+# Opp-VA runner pulled toward entry (stalls just short of far edge)
+RUNNER_PULL_VARIANTS = [
+    _k60(name="TP1_40pt", tp1_ticks=160, family="runner_pull",
+         note="control: TP1 40pt, opp VA exact"),
+] + [
+    _k60(
+        name=f"TP1_40_pull{pts}pt",
+        tp1_ticks=160,
+        opp_pull_ticks=pts * 4,
+        family="runner_pull",
+        note=f"TP1 40pt; opp VA {pts}pt closer to entry than at signal",
+    )
+    for pts in (5, 10, 15, 20, 25)
+]
+
+# Breakeven triggers on production 40pt base
+BE_POC_VARIANTS = [
+    _k60(name="TP1_40pt", tp1_ticks=160, family="be_poc",
+         note="control: TP1 40pt, no breakeven"),
+    _k60(name="TP1_40_be_tp1", tp1_ticks=160, move_be=True, family="be_poc",
+         note="BE after TP1 fill (already tested on K/20pt)"),
+    _k60(name="TP1_40_be_poc", tp1_ticks=160, be_on_poc=True, family="be_poc",
+         note="BE once price reaches entry-time POC"),
+    _k60(name="TP1_40_be_poc_tp1", tp1_ticks=160, move_be=True,
+         be_on_poc=True, family="be_poc",
+         note="BE on POC reach or TP1 fill, whichever first"),
 ]
 
 VARIANTS = LEGACY_VARIANTS
@@ -497,7 +531,8 @@ def simulate(timestamps, prices, poc, vah, val_area, day_ids,
              use_poc_rung, use_opp_rung, runner_ticks,
              min_poc_dist, move_be, trail_ticks,
              atr_ticks, atr_mult, tp1_min_ticks, tp1_max_ticks,
-             tp2_ticks, tp2_at_poc, tp1_lots, entry_ok):
+             tp2_ticks, tp2_at_poc, tp1_lots, entry_ok,
+             opp_pull_ticks, be_on_poc):
     n = len(prices)
 
     trades = np.full((MAX_TRADES, STAT0 + 6), -1, np.int64)
@@ -505,7 +540,7 @@ def simulate(timestamps, prices, poc, vah, val_area, day_ids,
 
     tc, cash, peak, dd, min_eq = 0, 0, 0, 0, 0
     position, entry, entry_time = 0, 0, 0
-    tp1_hit, best_price = 0, 0
+    tp1_hit, best_price, be_poc_armed = 0, 0, 0
 
     leg_open = np.zeros(MAX_LOTS, np.int64)
     leg_target = np.zeros(MAX_LOTS, np.int64)
@@ -556,7 +591,7 @@ def simulate(timestamps, prices, poc, vah, val_area, day_ids,
             else:
                 summary[1] += 1
             position, legs = 0, 0
-            tp1_hit, best_price = 0, 0
+            tp1_hit, best_price, be_poc_armed = 0, 0, 0
 
         # ---- per-leg exits: stop first, then target ----
         if position != 0:
@@ -648,7 +683,18 @@ def simulate(timestamps, prices, poc, vah, val_area, day_ids,
                 else:
                     summary[1] += 1
                 position, legs = 0, 0
-                tp1_hit, best_price = 0, 0
+                tp1_hit, best_price, be_poc_armed = 0, 0, 0
+
+        # ---- BE once price reaches entry-time POC (trade direction) ----
+        if (position != 0 and be_on_poc == 1 and be_poc_armed == 0
+                and ((position == 1 and price >= bpoc)
+                     or (position == -1 and price <= bpoc))):
+            be_poc_armed = 1
+            for j in range(legs):
+                if leg_open[j] == 1:
+                    if ((position == 1 and entry > leg_stop[j])
+                            or (position == -1 and entry < leg_stop[j])):
+                        leg_stop[j] = entry
 
         # ---- entry ----
         if (position == 0 and i > 0
@@ -711,7 +757,7 @@ def simulate(timestamps, prices, poc, vah, val_area, day_ids,
                         leg_kind[:] = -1
                         leg_target[:] = 0
                         leg_stop[:] = 0
-                        tp1_hit, best_price = 0, 0
+                        tp1_hit, best_price, be_poc_armed = 0, 0, 0
 
                         ptarget = entry
                         n_tp1 = tp1_lots if tp1_lots > 0 else 1
@@ -734,6 +780,10 @@ def simulate(timestamps, prices, poc, vah, val_area, day_ids,
                                     k >= n_tp1
                                     or (k >= 1 and use_poc_rung)):
                                 rp = cval if position == -1 else cvah
+                                if opp_pull_ticks > 0:
+                                    # Move target toward entry (long: down from
+                                    # VAH; short: up from VAL).
+                                    rp = rp - position * opp_pull_ticks
                                 kind = RUNG_OPP
                             elif runner_ticks > 0:
                                 rp = entry + position * runner_ticks
@@ -938,6 +988,8 @@ def select_variants(family: str | None, only: list[str] | None):
         "three_lot": THREE_LOT_VARIANTS,
         "scale_out": SCALE_OUT_VARIANTS,
         "vwap_filter": VWAP_FILTER_VARIANTS,
+        "runner_pull": RUNNER_PULL_VARIANTS,
+        "be_poc": BE_POC_VARIANTS,
         "tp_study": (
             STATIC_TP1_VARIANTS + ATR_TP1_VARIANTS[1:] + THREE_LOT_VARIANTS[1:]
             + SCALE_OUT_VARIANTS[1:]
@@ -949,6 +1001,8 @@ def select_variants(family: str | None, only: list[str] | None):
             + THREE_LOT_VARIANTS[1:]
             + SCALE_OUT_VARIANTS[1:]
             + VWAP_FILTER_VARIANTS[1:]
+            + RUNNER_PULL_VARIANTS[1:]
+            + BE_POC_VARIANTS[1:]
         ),
     }
     # De-dupe by name, first wins (keeps control once in tp_study).
@@ -1017,7 +1071,7 @@ def main():
         "--family",
         choices=(
             "legacy", "static_tp1", "atr_tp1", "three_lot", "scale_out",
-            "vwap_filter", "tp_study", "all",
+            "vwap_filter", "runner_pull", "be_poc", "tp_study", "all",
         ),
         default="legacy",
         help="variant family (default: legacy)",
@@ -1110,6 +1164,8 @@ def main():
                     int(v.tp2_ticks), 1 if v.tp2_at_poc else 0,
                     int(getattr(v, "tp1_lots", 1) or 1),
                     entry_ok,
+                    int(getattr(v, "opp_pull_ticks", 0) or 0),
+                    1 if getattr(v, "be_on_poc", False) else 0,
                 )
                 b = buckets[f"{v.name}|{fill}"]
                 dnet = 0

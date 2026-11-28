@@ -67,6 +67,8 @@ def run_variant(selected, variant, *, flush_to_close, gap_ticks, sessions_dir):
                 1 if getattr(variant, "tp2_at_poc", False) else 0,
                 int(getattr(variant, "tp1_lots", 1) or 1),
                 np.ones(len(prices), dtype=np.int8),
+                int(getattr(variant, "opp_pull_ticks", 0) or 0),
+                1 if getattr(variant, "be_on_poc", False) else 0,
             )
         finally:
             sweep.MIN_RUNG_GAP_TICKS = saved_gap
