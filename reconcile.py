@@ -72,6 +72,7 @@ def run_patched(selected, sessions_dir):
             False, 0,
             atr, 0.0, 60, 200, 0, 0, 1,
             np.ones(len(prices), dtype=np.int8),
+            0, 0,
         )
         for t in trades:
             out.append({

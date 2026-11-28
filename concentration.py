@@ -51,6 +51,8 @@ def run(selected, variant, sessions_dir):
             1 if getattr(variant, "tp2_at_poc", False) else 0,
             int(getattr(variant, "tp1_lots", 1) or 1),
             np.ones(len(prices), dtype=np.int8),
+            int(getattr(variant, "opp_pull_ticks", 0) or 0),
+            1 if getattr(variant, "be_on_poc", False) else 0,
         )
         for t in trades:
             legs = sum(1 for k in range(MAX_LOTS) if t[LEG_T0 + k] >= 0)
