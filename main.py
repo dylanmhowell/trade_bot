@@ -46,10 +46,17 @@ TOPSTEP_ENABLE_ORDERS = settings.topstep_enable_orders
 
 EASTERN = ZoneInfo("America/New_York")
 
-# K_two_lot_60 parameters (TP1 = 40 points)
+# Champion: ATR5×0.75 TP1 + BE@TP1 + opp VA +25pt + no Friday
 STOP_TICKS = settings.stop_ticks          # 60 points
 LOTS = settings.lots
-TP1_TICKS = settings.tp1_ticks            # 40 points
+TP1_TICKS = settings.tp1_ticks            # fallback when ATR off
+MOVE_BE = bool(settings.move_be)
+OPP_PULL_TICKS = int(settings.opp_pull_ticks)  # -100 = +25pt beyond opp VA
+NO_FRIDAY = bool(settings.no_friday)
+ATR_MULT = float(settings.atr_mult)
+ATR_LOOKBACK_DAYS = int(settings.atr_lookback_days)
+TP1_MIN_TICKS = int(settings.tp1_min_ticks)  # 15 points
+TP1_MAX_TICKS = int(settings.tp1_max_ticks)  # 100 points
 USE_POC_RUNG = False
 USE_OPP_RUNG = True
 RUNNER_TICKS = 0          # Runner goes to opposite VA edge
@@ -64,6 +71,9 @@ COMMISSION_CENTS = 50
 STOP_SLIP_TICKS = 1
 
 SESSIONS_DIR = Path("output/sessions")
+ATR_HISTORY_PATH = Path("output/live/atr_daily.json")
+ATR_MANUAL_PATH = Path("output/live/atr_manual.json")
+ATR_SEED_DIR = Path("output/diag_regime")
 REPLAY_SPEEDS = {"10": 10.0, "50": 50.0, "max": None}
 BROKER_SYNC_INTERVAL_SEC = 5.0
 SESSION_HEALTH_INTERVAL_SEC = 20.0
@@ -80,6 +90,11 @@ class TopstepAuthError(RuntimeError):
 
 class RunnerTPRequest(BaseModel):
     price: float
+
+
+class AtrLookbackRequest(BaseModel):
+    """Manual 5-day mean ATR in points (ATR(14) on 15m RTH). null clears."""
+    atr_pts: Optional[float] = None
 
 
 class State(Enum):
@@ -157,6 +172,7 @@ class KTwoLot60Engine:
         self.session_date: Optional[str] = None
         self.entry_window_open = False
         self.rth_active = False
+        self.friday_blocked = False
 
         # Statistics
         self.daily_trades: list[TradeSummary] = []
@@ -166,6 +182,20 @@ class KTwoLot60Engine:
         self.max_drawdown_cents = 0
         # Live mode clears this until today's VA has been seeded from history
         self.entries_enabled = True
+
+        # Champion extras: ATR lookback TP1, BE, runner push
+        self._entry_tp1_ticks: Optional[int] = None
+        self._manual_atr_pts: Optional[float] = None
+        self._atr_history: list[dict] = []
+        self._atr_bar_key: Optional[tuple] = None
+        self._atr_bar: Optional[list[int]] = None  # [high, low, close]
+        self._atr_trs: list[float] = []
+        self._atr_wilder: Optional[float] = None
+        self._atr_prev_close: Optional[int] = None
+        self._atr_samples_today: list[int] = []
+        self._atr_sample_date: Optional[str] = None
+        self._load_atr_history()
+        self._load_manual_atr()
 
     def _px(self, ticks: Optional[int]) -> Optional[float]:
         return None if ticks is None else ticks / 4.0
@@ -181,6 +211,7 @@ class KTwoLot60Engine:
 
         # Update session timing
         self._update_session_state(ts, is_rth)
+        self._update_atr_bars(price, ts, is_rth)
 
         if not is_rth:
             # Force close any position at RTH end
@@ -211,10 +242,14 @@ class KTwoLot60Engine:
             if not self.entries_enabled:
                 # Only note when a trigger cross actually happens
                 self._check_entry(price, ts, log_only_block="entries_disabled")
+            elif self.friday_blocked:
+                self._check_entry(price, ts, log_only_block="friday_blocked")
             elif not self.entry_window_open:
                 self._check_entry(
                     price, ts, log_only_block="outside_entry_window"
                 )
+            elif self._effective_tp1_ticks() is None:
+                self._check_entry(price, ts, log_only_block="atr_not_warm")
             else:
                 entry_action = self._check_entry(price, ts)
                 if entry_action:
@@ -226,6 +261,7 @@ class KTwoLot60Engine:
 
     def _update_session_state(self, ts: datetime, is_rth: bool):
         """Update entry window and RTH state."""
+        was_rth = self.rth_active
         self.rth_active = is_rth
 
         ts_et = ts.astimezone(EASTERN)
@@ -233,26 +269,267 @@ class KTwoLot60Engine:
         date = ts_et.date().isoformat()
 
         if date != self.session_date:
+            if self.session_date:
+                self._finalize_day_atr(self.session_date)
             self.session_date = date
             self.daily_trades = []
             self.daily_realized_cents = 0
             self.equity_peak_cents = 0
             self.max_drawdown_cents = 0
             self.total_commission_cents = 0
+            self._reset_atr_intraday(date)
             if not self.position:
                 self.state = State.FLAT
                 self.origin = 0
                 self.prev_price = None
                 self.mark_price = None
 
+        # Persist today's ATR once RTH ends (bot may stop before midnight)
+        if was_rth and not is_rth and self.session_date:
+            self._finalize_day_atr(self.session_date)
+
         entry_start = clock(ENTRY_HOUR, ENTRY_MINUTE)
-        self.entry_window_open = entry_start <= t < ENTRY_END
+        self.friday_blocked = NO_FRIDAY and ts_et.weekday() == 4
+        self.entry_window_open = (
+            entry_start <= t < ENTRY_END and not self.friday_blocked
+        )
         if self.diag:
             self.diag.entry_window(
                 self.entry_window_open,
                 ts=ts,
                 time_et=t.isoformat(timespec="seconds"),
+                friday_blocked=self.friday_blocked,
             )
+
+    def _load_atr_history(self):
+        """Seed prior-day ATR ticks from diag CSVs + live persistence."""
+        by_date: dict[str, int] = {}
+        if ATR_SEED_DIR.exists():
+            for path in sorted(ATR_SEED_DIR.glob("atr_tick_*.csv")):
+                try:
+                    text = path.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                lines = text.strip().splitlines()
+                if len(lines) < 2:
+                    continue
+                header = [h.strip() for h in lines[0].split(",")]
+                try:
+                    day_i = header.index("day")
+                    atr_i = header.index("atr_mean_pts")
+                except ValueError:
+                    continue
+                for line in lines[1:]:
+                    parts = line.split(",")
+                    if len(parts) <= max(day_i, atr_i):
+                        continue
+                    day = parts[day_i].strip()
+                    try:
+                        pts = float(parts[atr_i])
+                    except ValueError:
+                        continue
+                    by_date[day] = int(round(pts * 4.0))
+        if ATR_HISTORY_PATH.exists():
+            try:
+                raw = json.loads(ATR_HISTORY_PATH.read_text(encoding="utf-8"))
+                if isinstance(raw, list):
+                    for row in raw:
+                        day = str(row.get("date") or "")
+                        ticks = row.get("atr_ticks")
+                        if day and ticks is not None:
+                            by_date[day] = int(ticks)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                pass
+        self._atr_history = [
+            {"date": d, "atr_ticks": by_date[d]} for d in sorted(by_date)
+        ]
+
+    def _save_atr_history(self):
+        ATR_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ATR_HISTORY_PATH.write_text(
+            json.dumps(self._atr_history, indent=2),
+            encoding="utf-8",
+        )
+
+    def _reset_atr_intraday(self, date: str):
+        self._atr_bar_key = None
+        self._atr_bar = None
+        self._atr_trs = []
+        self._atr_wilder = None
+        self._atr_prev_close = None
+        self._atr_samples_today = []
+        self._atr_sample_date = date
+
+    def _finalize_day_atr(self, date: str):
+        """Append today's mean warm ATR once the session is done."""
+        if not self._atr_samples_today:
+            return
+        if any(row["date"] == date for row in self._atr_history):
+            return
+        mean_ticks = int(
+            round(float(np.mean(np.asarray(self._atr_samples_today))))
+        )
+        if mean_ticks <= 0:
+            return
+        self._atr_history.append({"date": date, "atr_ticks": mean_ticks})
+        self._save_atr_history()
+        if self.diag:
+            self.diag.info(
+                "atr_day_finalized",
+                date=date,
+                atr_ticks=mean_ticks,
+                atr_pts=mean_ticks / 4.0,
+                samples=len(self._atr_samples_today),
+            )
+
+    def _close_atr_bar(self):
+        """Complete the current 15m bar and update Wilder ATR samples."""
+        if not self._atr_bar:
+            return
+        h, l, c = self._atr_bar
+        if self._atr_prev_close is None:
+            tr = float(h - l)
+        else:
+            pc = self._atr_prev_close
+            tr = float(max(h - l, abs(h - pc), abs(l - pc)))
+        self._atr_trs.append(tr)
+        length = 14
+        if len(self._atr_trs) < length:
+            atr_val = 0
+        elif len(self._atr_trs) == length:
+            self._atr_wilder = sum(self._atr_trs) / float(length)
+            atr_val = int(round(self._atr_wilder))
+        else:
+            self._atr_wilder = (
+                self._atr_wilder * (length - 1) + tr
+            ) / float(length)
+            atr_val = int(round(self._atr_wilder))
+        self._atr_prev_close = c
+        if atr_val > 0:
+            self._atr_samples_today.append(atr_val)
+
+    def _update_atr_bars(self, price: int, ts: datetime, is_rth: bool):
+        """Accumulate RTH 15m bars for the next day's ATR lookback."""
+        if ATR_MULT <= 0 or ATR_LOOKBACK_DAYS <= 0:
+            return
+        ts_et = ts.astimezone(EASTERN)
+        date = ts_et.date().isoformat()
+        if self._atr_sample_date != date:
+            self._reset_atr_intraday(date)
+        if not is_rth:
+            if self._atr_bar is not None:
+                self._close_atr_bar()
+                self._atr_bar = None
+                self._atr_bar_key = None
+            return
+        minutes = ts_et.hour * 60 + ts_et.minute
+        floored = (minutes // 15) * 15
+        key = (date, floored)
+        if key != self._atr_bar_key:
+            if self._atr_bar is not None:
+                self._close_atr_bar()
+            self._atr_bar_key = key
+            self._atr_bar = [price, price, price]
+        else:
+            bar = self._atr_bar
+            if price > bar[0]:
+                bar[0] = price
+            if price < bar[1]:
+                bar[1] = price
+            bar[2] = price
+
+    def _load_manual_atr(self):
+        if not ATR_MANUAL_PATH.exists():
+            return
+        try:
+            raw = json.loads(ATR_MANUAL_PATH.read_text(encoding="utf-8"))
+            pts = raw.get("atr_pts")
+            if pts is None:
+                self._manual_atr_pts = None
+            else:
+                self._manual_atr_pts = float(pts)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    def _save_manual_atr(self):
+        ATR_MANUAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ATR_MANUAL_PATH.write_text(
+            json.dumps({"atr_pts": self._manual_atr_pts}, indent=2),
+            encoding="utf-8",
+        )
+
+    def set_manual_atr_pts(self, atr_pts: Optional[float]) -> dict:
+        """Set/clear manual 5-day mean ATR in points (ATR(14) on 15m RTH)."""
+        if atr_pts is None:
+            self._manual_atr_pts = None
+        else:
+            pts = float(atr_pts)
+            if pts <= 0:
+                raise ValueError("atr_pts must be > 0")
+            self._manual_atr_pts = pts
+        self._save_manual_atr()
+        tp1 = self._effective_tp1_ticks()
+        return {
+            "atr_pts": self._manual_atr_pts,
+            "tp1_ticks": tp1,
+            "tp1_pts": None if tp1 is None else tp1 / 4.0,
+            "source": self._atr_source(),
+        }
+
+    def _lookback_atr_ticks(self) -> Optional[int]:
+        """Mean of prior N session ATRs in ticks, or None if not warm."""
+        if self._manual_atr_pts is not None:
+            return int(round(float(self._manual_atr_pts) * 4.0))
+        if ATR_MULT <= 0 or ATR_LOOKBACK_DAYS <= 0:
+            return None
+        if len(self._atr_history) < ATR_LOOKBACK_DAYS:
+            return None
+        look = [
+            int(row["atr_ticks"])
+            for row in self._atr_history[-ATR_LOOKBACK_DAYS:]
+        ]
+        return int(round(float(np.mean(np.asarray(look)))))
+
+    def _atr_source(self) -> str:
+        if self._manual_atr_pts is not None:
+            return "manual"
+        if ATR_MULT <= 0 or ATR_LOOKBACK_DAYS <= 0:
+            return "static"
+        if len(self._atr_history) >= ATR_LOOKBACK_DAYS:
+            return "history"
+        return "none"
+
+    def _effective_tp1_ticks(self) -> Optional[int]:
+        """TP1 ticks from ATR lookback / manual override, or static fallback."""
+        if ATR_MULT <= 0 or ATR_LOOKBACK_DAYS <= 0:
+            return TP1_TICKS
+        mean_atr = self._lookback_atr_ticks()
+        if mean_atr is None:
+            return None
+        raw = int(round(mean_atr * ATR_MULT))
+        if raw < TP1_MIN_TICKS:
+            raw = TP1_MIN_TICKS
+        if raw > TP1_MAX_TICKS:
+            raw = TP1_MAX_TICKS
+        return raw
+
+    def apply_breakeven_stops(self) -> bool:
+        """Move open-leg stops to entry if that improves them (BE@TP1)."""
+        pos = self.position
+        if not pos or not MOVE_BE:
+            return False
+        moved = False
+        entry = pos.entry_price
+        for leg in pos.legs:
+            if not leg.open:
+                continue
+            if (
+                (pos.direction == 1 and entry > leg.stop)
+                or (pos.direction == -1 and entry < leg.stop)
+            ):
+                leg.stop = entry
+                moved = True
+        return moved
 
     def _unrealized_cents(self) -> int:
         ref_price = (
@@ -410,15 +687,21 @@ class KTwoLot60Engine:
 
         # Calculate targets and stops
         stop = price - direction * STOP_TICKS
+        tp1_ticks = self._effective_tp1_ticks()
+        if tp1_ticks is None:
+            tp1_ticks = TP1_TICKS
+        self._entry_tp1_ticks = tp1_ticks
 
-        # Leg 1: TP1 at 40 points
+        # Leg 1: ATR-sized TP1 (champion) / static fallback
         self.position.legs[0].open = True
-        self.position.legs[0].target = price + direction * TP1_TICKS
+        self.position.legs[0].target = price + direction * tp1_ticks
         self.position.legs[0].stop = stop
         self.position.legs[0].kind = "tp1"
 
-        # Leg 2: Opposite VA edge (or stop out)
+        # Leg 2: Opposite VA edge ± pull/push (champion: +25pt beyond)
         opp_target = self.profile.val if direction == -1 else self.profile.vah
+        if OPP_PULL_TICKS != 0:
+            opp_target = opp_target - direction * OPP_PULL_TICKS
         self.position.legs[1].open = True
         self.position.legs[1].target = opp_target
         self.position.legs[1].stop = stop
@@ -435,7 +718,11 @@ class KTwoLot60Engine:
                 trigger=self._px(trigger_price),
                 stop=self._px(stop),
                 tp1=self._px(self.position.legs[0].target),
+                tp1_ticks=tp1_ticks,
+                tp1_pts=tp1_ticks / 4.0,
+                atr_source=self._atr_source(),
                 opp=self._px(opp_target),
+                opp_pull_ticks=OPP_PULL_TICKS,
                 poc=self._px(self.profile.poc),
                 vah=self._px(self.profile.vah),
                 val=self._px(self.profile.val),
@@ -472,9 +759,10 @@ class KTwoLot60Engine:
         pos = self.position
         if not pos or pos.direction == 0:
             return None
+        tp1_ticks = self._entry_tp1_ticks or self._effective_tp1_ticks() or TP1_TICKS
         pos.entry_price = fill_ticks
         stop = fill_ticks - pos.direction * STOP_TICKS
-        pos.legs[0].target = fill_ticks + pos.direction * TP1_TICKS
+        pos.legs[0].target = fill_ticks + pos.direction * tp1_ticks
         pos.legs[0].stop = stop
         pos.legs[1].stop = stop
         return [
@@ -584,6 +872,19 @@ class KTwoLot60Engine:
                         fill=self._px(fill),
                         entry=self._px(pos.entry_price),
                     )
+                # Champion: after TP1, move surviving stops to breakeven
+                if leg.kind == "tp1" and self.apply_breakeven_stops():
+                    actions.append({
+                        "action": "move_be",
+                        "price": pos.entry_price,
+                        "timestamp": ts.isoformat(),
+                    })
+                    if self.diag:
+                        self.diag.info(
+                            "move_be",
+                            ts=ts,
+                            entry=self._px(pos.entry_price),
+                        )
                 continue
 
             all_closed = False
@@ -764,12 +1065,16 @@ class KTwoLot60Engine:
             )
 
         armed = self.state in (State.ARMED_SHORT, State.ARMED_LONG)
+        tp1_ticks = self._effective_tp1_ticks()
+        atr_ticks = self._lookback_atr_ticks()
+        atr_warm = tp1_ticks is not None
         can_enter = bool(
             self.entries_enabled
             and self.entry_window_open
             and armed
             and not self.position
             and poc_dist_ok
+            and atr_warm
         )
 
         last_ticks = (
@@ -798,6 +1103,7 @@ class KTwoLot60Engine:
             "max_drawdown": self.max_drawdown_cents / 100.0,
             "entries_enabled": self.entries_enabled,
             "entry_window_open": self.entry_window_open,
+            "friday_blocked": self.friday_blocked,
             "rth_active": self.rth_active,
             "origin": self.origin,
             "armed": armed,
@@ -807,6 +1113,24 @@ class KTwoLot60Engine:
             "can_enter": can_enter,
             "daily_trades": len(self.daily_trades),
             "total_commission": self.total_commission_cents / 100.0,
+            "champion": {
+                "move_be": MOVE_BE,
+                "opp_pull_ticks": OPP_PULL_TICKS,
+                "no_friday": NO_FRIDAY,
+                "atr_mult": ATR_MULT,
+                "atr_lookback_days": ATR_LOOKBACK_DAYS,
+                "atr_timeframe": "15m RTH ATR(14)",
+            },
+            "atr": {
+                "manual_pts": self._manual_atr_pts,
+                "lookback_pts": None if atr_ticks is None else atr_ticks / 4.0,
+                "lookback_ticks": atr_ticks,
+                "tp1_ticks": tp1_ticks,
+                "tp1_pts": None if tp1_ticks is None else tp1_ticks / 4.0,
+                "source": self._atr_source(),
+                "history_days": len(self._atr_history),
+                "warm": atr_warm,
+            },
             "profile": {
                 "poc": self.profile.poc / 4.0,
                 "vah": self.profile.vah / 4.0,
@@ -1702,28 +2026,109 @@ class ConnectionManager:
         return brackets
 
     async def on_single_leg_filled_broker(self, leg_key: str = "tp1"):
-        """After one leg closes, shrink stop to 1 lot and drop its order id."""
+        """After one leg closes, shrink stop to 1 lot; BE@TP1 moves stop price."""
         self.working_exits[leg_key] = None
         stop_id = self.working_exits.get("stop")
         if not stop_id or not self.topstep or not TOPSTEP_ENABLE_ORDERS:
             return
+        stop_price = None
+        if MOVE_BE and leg_key == "tp1" and self.engine:
+            self.engine.apply_breakeven_stops()
+            if self.engine.position:
+                stop_price = self.engine.position.entry_price / 4.0
         try:
-            result = await self.topstep.modify_order(stop_id, size=1)
+            result = await self.topstep.modify_order(
+                stop_id, size=1, stop_price=stop_price
+            )
             if self.diag:
                 self.diag.info(
                     "stop_resize",
                     orderId=stop_id,
                     size=1,
+                    stopPrice=stop_price,
+                    move_be=bool(stop_price is not None),
                     success=result.get("success"),
                     errorCode=result.get("errorCode"),
                 )
             await self.broadcast({
                 "type": "broker",
-                "data": {"action": "stop_resize", "broker": result, "size": 1},
+                "data": {
+                    "action": "stop_resize",
+                    "broker": result,
+                    "size": 1,
+                    "stopPrice": stop_price,
+                },
             })
         except Exception as e:
             if self.diag:
                 self.diag.info("stop_resize_error", error=str(e))
+
+    def set_atr_lookback(self, atr_pts: Optional[float]) -> dict:
+        """Persist manual 5d ATR (pts) and apply to the live engine if running."""
+        if self.engine:
+            info = self.engine.set_manual_atr_pts(atr_pts)
+            status = self._engine_status_with_broker()
+            return {"success": True, **info, "status": status}
+
+        # No engine yet — write the same file the engine loads on start
+        if atr_pts is None:
+            saved = None
+        else:
+            pts = float(atr_pts)
+            if pts <= 0:
+                raise ValueError("atr_pts must be > 0")
+            saved = pts
+        ATR_MANUAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ATR_MANUAL_PATH.write_text(
+            json.dumps({"atr_pts": saved}, indent=2),
+            encoding="utf-8",
+        )
+        tp1 = None
+        if saved is not None and ATR_MULT > 0:
+            mean_ticks = int(round(saved * 4.0))
+            raw = int(round(mean_ticks * ATR_MULT))
+            raw = max(TP1_MIN_TICKS, min(TP1_MAX_TICKS, raw))
+            tp1 = raw
+        return {
+            "success": True,
+            "atr_pts": saved,
+            "tp1_ticks": tp1,
+            "tp1_pts": None if tp1 is None else tp1 / 4.0,
+            "source": "manual" if saved is not None else "none",
+            "status": None,
+        }
+
+    def get_atr_lookback(self) -> dict:
+        if self.engine:
+            st = self.engine.get_status()
+            atr = st.get("atr") or {}
+            return {"success": True, **atr, "status": st}
+        manual = None
+        if ATR_MANUAL_PATH.exists():
+            try:
+                raw = json.loads(ATR_MANUAL_PATH.read_text(encoding="utf-8"))
+                if raw.get("atr_pts") is not None:
+                    manual = float(raw["atr_pts"])
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                pass
+        tp1 = None
+        if manual is not None and ATR_MULT > 0:
+            mean_ticks = int(round(manual * 4.0))
+            raw = int(round(mean_ticks * ATR_MULT))
+            tp1 = max(TP1_MIN_TICKS, min(TP1_MAX_TICKS, raw))
+        return {
+            "success": True,
+            "manual_pts": manual,
+            "lookback_pts": manual,
+            "tp1_ticks": tp1,
+            "tp1_pts": None if tp1 is None else tp1 / 4.0,
+            "source": "manual" if manual is not None else "none",
+            "warm": tp1 is not None,
+            "atr_timeframe": "15m RTH ATR(14)",
+            "atr_mult": ATR_MULT,
+            "atr_lookback_days": ATR_LOOKBACK_DAYS,
+            "status": None,
+        }
 
     async def update_runner_tp(self, price: float) -> dict:
         """Move the runner take-profit (engine + resting limit order)."""
@@ -3018,6 +3423,34 @@ async def websocket_endpoint(websocket: WebSocket):
                         "message": f"Runner update failed: {e}",
                     })
 
+            elif cmd == "set_atr_lookback":
+                try:
+                    raw = data.get("atr_pts", None)
+                    atr_pts = None if raw is None or raw == "" else float(raw)
+                    result = manager.set_atr_lookback(atr_pts)
+                    pts = result.get("atr_pts")
+                    tp1 = result.get("tp1_pts")
+                    await websocket.send_json({
+                        "type": "atr_lookback",
+                        "success": True,
+                        "atr_pts": pts,
+                        "tp1_pts": tp1,
+                        "status": result.get("status"),
+                        "message": (
+                            "5d ATR cleared"
+                            if pts is None
+                            else (
+                                f"5d ATR {pts:.2f} pt → TP1 "
+                                f"{(tp1 or 0):.2f} pt"
+                            )
+                        ),
+                    })
+                except Exception as e:
+                    await websocket.send_json({
+                        "type": "status",
+                        "message": f"ATR lookback update failed: {e}",
+                    })
+
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
@@ -3082,6 +3515,24 @@ async def update_runner_tp(payload: RunnerTPRequest):
     """Update runner take-profit price: {\"price\": 26350.25}."""
     try:
         return await manager.update_runner_tp(payload.price)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/strategy/atr-lookback")
+async def get_atr_lookback():
+    """Current manual/auto 5-day mean ATR and implied TP1."""
+    try:
+        return manager.get_atr_lookback()
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/strategy/atr-lookback")
+async def set_atr_lookback(payload: AtrLookbackRequest):
+    """Set manual 5-day mean ATR in points (ATR(14) on 15m RTH). null clears."""
+    try:
+        return manager.set_atr_lookback(payload.atr_pts)
     except Exception as e:
         return {"success": False, "error": str(e)}
 

@@ -8,10 +8,11 @@ Live / replay / test harness for an MNQ value-area strategy, with a dark React d
 
 - Builds a developing **value area** (POC / VAH / VAL) from RTH ticks
 - Arms after a POC cross, then enters on a **VAH** (short) or **VAL** (long) cross
-- Trades **2 MNQ lots**:
-  - **TP1**: +40 points on 1 lot
-  - **Runner**: opposite VA edge on 1 lot (adjustable in the UI)
-  - **Stop**: −60 points (2 lots at entry; resized to 1 after TP1)
+- Trades **2 MNQ lots** (champion: ATR5×0.75 + BE@TP1 + runner +25pt + no Friday):
+  - **TP1**: `0.75 ×` mean of prior **5** sessions' **ATR(14) on 15m RTH** bars (clamp 15–100 pt). Enter the 5d ATR manually in the UI if history isn't available.
+  - **Runner**: opposite VA edge **+25 points** beyond (adjustable in the UI)
+  - **Stop**: −60 points (2 lots at entry; resized to 1 and moved to **breakeven** after TP1)
+  - **No Friday** entries
 - In **Live** mode, rests broker limit TPs + a stop on entry, syncs to Topstep positions, and can reclaim a stolen API session
 
 All session rules and UI times are **US/Eastern**.

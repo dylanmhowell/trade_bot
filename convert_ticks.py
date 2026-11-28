@@ -18,8 +18,9 @@ UTC = ZoneInfo("UTC")
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 ZONES = {"ct": CT, "et": EASTERN, "utc": UTC}
 
-BASE = 80000
-SIZE = 80000
+# Must cover the same quarter-point window as sweep.py
+BASE = 60_000
+SIZE = 100_000
 TICK_SIZE = 0.25
 
 

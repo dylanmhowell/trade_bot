@@ -17,8 +17,10 @@ EASTERN = ZoneInfo("America/New_York")
 UTC = timezone.utc
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
-BASE = 80_000
-SIZE = 80_000
+# Quarter-point tick window for the volume-profile histogram.
+# Wide enough for 2025–2026 MNQ (~16.5k–26.5k → ~66k–106k ticks).
+BASE = 60_000
+SIZE = 100_000
 MAX_TRADES = 5_000
 MAX_LOTS = 4
 
@@ -78,12 +80,17 @@ class Variant:
     # >0 → must have been outside continuously for that long.
     vwap_sigma: float = 0.0
     vwap_persist_secs: int = 0
-    # Pull opp-VA runner target toward entry (ticks). Helps when price
-    # stalls just short of the far VA edge.
+    # Offset opp-VA runner vs the far edge at entry (ticks).
+    # Positive = toward entry (pull in); negative = beyond VA (push out).
     opp_pull_ticks: int = 0
     # Move surviving stops to entry once price reaches the entry-time POC
     # in the trade's favor (distinct from move_be, which fires on TP1 fill).
     be_on_poc: bool = False
+    no_friday: bool = False
+    # When >0 with atr_mult: TP1 = clamp(mean(prior N days' ATR) * atr_mult)
+    # instead of developing intraday ATR.
+    atr_lookback_days: int = 0
+    tp1_max_ticks: int = 0      # 0 → use module TP1_MAX_TICKS
     family: str = "legacy"
     note: str = ""
 
@@ -211,6 +218,21 @@ RUNNER_PULL_VARIANTS = [
     for pts in (5, 10, 15, 20, 25)
 ]
 
+# Opp-VA runner pushed beyond the far edge (same offsets the other way)
+RUNNER_PUSH_VARIANTS = [
+    _k60(name="TP1_40pt", tp1_ticks=160, family="runner_push",
+         note="control: TP1 40pt, opp VA exact"),
+] + [
+    _k60(
+        name=f"TP1_40_push{pts}pt",
+        tp1_ticks=160,
+        opp_pull_ticks=-(pts * 4),
+        family="runner_push",
+        note=f"TP1 40pt; opp VA {pts}pt beyond far edge at signal",
+    )
+    for pts in (5, 10, 15, 20, 25)
+]
+
 # Breakeven triggers on production 40pt base
 BE_POC_VARIANTS = [
     _k60(name="TP1_40pt", tp1_ticks=160, family="be_poc",
@@ -222,6 +244,72 @@ BE_POC_VARIANTS = [
     _k60(name="TP1_40_be_poc_tp1", tp1_ticks=160, move_be=True,
          be_on_poc=True, family="be_poc",
          note="BE on POC reach or TP1 fill, whichever first"),
+]
+
+# Shortlist for OOS / holdout checks (production candidates)
+CHAMPION_VARIANTS = [
+    _k60(name="K_two_lot_60", family="champion",
+         note="original TP1 20pt + opp VA, 60pt stop"),
+    _k60(name="TP1_40pt", tp1_ticks=160, family="champion",
+         note="production TP1 40pt, no BE"),
+    _k60(name="TP1_40_be_tp1", tp1_ticks=160, move_be=True, family="champion",
+         note="40pt + BE after TP1"),
+    _k60(name="TP1_40_be_tp1_push25pt", tp1_ticks=160, move_be=True,
+         opp_pull_ticks=-100, family="champion",
+         note="40pt + BE@TP1 + opp VA +25pt (primary favorite)"),
+]
+
+# Same champions with no Friday entries
+CHAMPION_NOFRI_VARIANTS = [
+    _k60(name=f"{v.name}_nofri", tp1_ticks=v.tp1_ticks, move_be=v.move_be,
+         opp_pull_ticks=v.opp_pull_ticks, no_friday=True, family="champion_nofri",
+         note=f"{v.note}; no Friday entries")
+    for v in CHAMPION_VARIANTS
+]
+
+# TP1 = 0.75 × mean(prior 5 trading days' RTH ATR); optional BE/push/nofri
+ATR5_VARIANTS = [
+    _k60(name="ATR5_x0p75", atr_mult=0.75, atr_lookback_days=5,
+         tp1_max_ticks=400, family="atr5",
+         note="TP1=0.75×mean ATR(prior 5 days); clamp 15–100pt"),
+    _k60(name="ATR5_x0p75_be", atr_mult=0.75, atr_lookback_days=5,
+         tp1_max_ticks=400, move_be=True, family="atr5",
+         note="ATR5×0.75 + BE after TP1"),
+    _k60(name="ATR5_x0p75_be_push25", atr_mult=0.75, atr_lookback_days=5,
+         tp1_max_ticks=400, move_be=True, opp_pull_ticks=-100, family="atr5",
+         note="ATR5×0.75 + BE@TP1 + opp VA +25pt"),
+    _k60(name="ATR5_x0p75_nofri", atr_mult=0.75, atr_lookback_days=5,
+         tp1_max_ticks=400, no_friday=True, family="atr5",
+         note="ATR5×0.75; no Friday entries"),
+    _k60(name="ATR5_x0p75_be_nofri", atr_mult=0.75, atr_lookback_days=5,
+         tp1_max_ticks=400, move_be=True, no_friday=True, family="atr5",
+         note="ATR5×0.75 + BE; no Friday"),
+    _k60(name="ATR5_x0p75_be_push25_nofri", atr_mult=0.75, atr_lookback_days=5,
+         tp1_max_ticks=400, move_be=True, opp_pull_ticks=-100, no_friday=True,
+         family="atr5",
+         note="ATR5×0.75 + BE + push25; no Friday"),
+]
+
+# Stack: BE-after-TP1 baseline + runner push beyond opp VA
+BE_PUSH_VARIANTS = [
+    _k60(name="TP1_40_be_tp1", tp1_ticks=160, move_be=True, family="be_push",
+         note="control: TP1 40pt + BE after TP1"),
+] + [
+    _k60(
+        name=f"TP1_40_be_tp1_push{pts}pt",
+        tp1_ticks=160,
+        move_be=True,
+        opp_pull_ticks=-(pts * 4),
+        family="be_push",
+        note=f"40pt + BE@TP1; opp VA {pts}pt beyond far edge",
+    )
+    for pts in (15, 20, 25)
+] + [
+    _k60(name="TP1_50_be_tp1", tp1_ticks=200, move_be=True, family="be_push",
+         note="side check: TP1 50pt + BE after TP1"),
+    _k60(name="TP1_50_be_tp1_push25pt", tp1_ticks=200, move_be=True,
+         opp_pull_ticks=-100, family="be_push",
+         note="side check: 50pt + BE@TP1 + opp VA +25pt"),
 ]
 
 VARIANTS = LEGACY_VARIANTS
@@ -412,6 +500,15 @@ def atr_15m_ticks(prices, stamps, length=ATR_LEN, bar_minutes=ATR_BAR_MINUTES):
             j += 1
         out[i] = last_atr
     return out
+
+
+def session_mean_atr_ticks(prices, stamps):
+    """Mean warm RTH ATR(14,15m) for a session, in ticks. 0 if not warm."""
+    atr = atr_15m_ticks(prices, stamps)
+    warm = atr[atr > 0]
+    if len(warm) == 0:
+        return 0
+    return int(round(float(warm.mean())))
 
 
 # ---------------------------------------------------------- profile building
@@ -780,9 +877,8 @@ def simulate(timestamps, prices, poc, vah, val_area, day_ids,
                                     k >= n_tp1
                                     or (k >= 1 and use_poc_rung)):
                                 rp = cval if position == -1 else cvah
-                                if opp_pull_ticks > 0:
-                                    # Move target toward entry (long: down from
-                                    # VAH; short: up from VAL).
+                                if opp_pull_ticks != 0:
+                                    # +pull toward entry; -push beyond VA edge.
                                     rp = rp - position * opp_pull_ticks
                                 kind = RUNG_OPP
                             elif runner_ticks > 0:
@@ -920,12 +1016,24 @@ def analyze_prop_firm(
     dd_limit=PROP_DD_LIMIT_CENTS,
     target=PROP_TARGET_CENTS,
     cap_floor_at_zero=True,
+    mode="combine",
 ):
-    """Evaluate EOD trailing drawdown and prop-firm pass rate.
+    """Evaluate EOD trailing drawdown and prop-firm outcomes.
 
     days: list of (day_str, day_net_cents, intraday_dd_cents, min_eq_cents)
-    cap_floor_at_zero: True if the EOD trailing floor stops rising at $0 P&L
-                       once best EOD profit reaches dd_limit.
+
+    mode="combine" (Trading Combine / eval):
+      - MLL trails best EOD balance by dd_limit, locks at $0 once HWM ≥ dd_limit
+      - PASS if balance hits `target` ($3k) before touching MLL
+      - FAIL if MLL hit; OPEN if sample ends first
+
+    mode="xfa" (50K Express Funded Account):
+      - Same trailing MLL lock-at-$0 behavior (no Combine profit target)
+      - SURVIVE if MLL never hit through end of sample; FAIL if hit
+      - pass_rate = fraction of start days that SURVIVE (never blow up)
+
+    cap_floor_at_zero: floor = min(hwm - dd_limit, 0) so MLL never rises
+                       above the $0 starting balance (Topstep trailing MLL).
     """
     cum_pnl = 0
     best_eod = 0
@@ -945,30 +1053,49 @@ def analyze_prop_firm(
         max_eod_dd = max(max_eod_dd, best_eod - cum_pnl)
         curve.append((day, dnet, cum_pnl, best_eod, best_eod - intraday_low))
 
+    def mll_floor(hwm):
+        if cap_floor_at_zero:
+            return min(hwm - dd_limit, 0)
+        return hwm - dd_limit
+
     def run_eval(start_idx):
         bal, hwm = 0, 0
         for step, (_, dnet, _, min_eq) in enumerate(days[start_idx:], 1):
-            floor = min(hwm - dd_limit, 0) if cap_floor_at_zero else (hwm - dd_limit)
+            floor = mll_floor(hwm)
             if bal + min_eq <= floor:
                 return "FAIL", step
             bal += dnet
             if bal <= floor:
                 return "FAIL", step
-            if bal >= target:
-                return "PASS", step
             hwm = max(hwm, bal)
+            if mode == "combine" and bal >= target:
+                return "PASS", step
+        if mode == "xfa":
+            return "SURVIVE", len(days) - start_idx
         return "OPEN", len(days) - start_idx
 
-    d1_status, d1_days = run_eval(0) if days else ("OPEN", 0)
-    passes = fails = 0
+    if not days:
+        return {
+            "max_daily_dd": 0, "worst_day": 0, "max_eod_dd": 0,
+            "eval_d1": "OPEN(0d)", "pass_rate": None, "curve": [],
+        }
+
+    d1_status, d1_days = run_eval(0)
+    good = bad = 0
     for idx in range(len(days)):
         st, _ = run_eval(idx)
-        if st == "PASS":
-            passes += 1
-        elif st == "FAIL":
-            fails += 1
-    resolved = passes + fails
-    pass_rate = round(passes / resolved, 3) if resolved > 0 else None
+        if mode == "combine":
+            if st == "PASS":
+                good += 1
+            elif st == "FAIL":
+                bad += 1
+        else:  # xfa
+            if st == "SURVIVE":
+                good += 1
+            elif st == "FAIL":
+                bad += 1
+    resolved = good + bad
+    pass_rate = round(good / resolved, 3) if resolved > 0 else None
 
     return {
         "max_daily_dd": round(max_daily_dd / 100, 2),
@@ -989,7 +1116,12 @@ def select_variants(family: str | None, only: list[str] | None):
         "scale_out": SCALE_OUT_VARIANTS,
         "vwap_filter": VWAP_FILTER_VARIANTS,
         "runner_pull": RUNNER_PULL_VARIANTS,
+        "runner_push": RUNNER_PUSH_VARIANTS,
         "be_poc": BE_POC_VARIANTS,
+        "be_push": BE_PUSH_VARIANTS,
+        "champion": CHAMPION_VARIANTS,
+        "champion_nofri": CHAMPION_NOFRI_VARIANTS,
+        "atr5": ATR5_VARIANTS,
         "tp_study": (
             STATIC_TP1_VARIANTS + ATR_TP1_VARIANTS[1:] + THREE_LOT_VARIANTS[1:]
             + SCALE_OUT_VARIANTS[1:]
@@ -1002,7 +1134,11 @@ def select_variants(family: str | None, only: list[str] | None):
             + SCALE_OUT_VARIANTS[1:]
             + VWAP_FILTER_VARIANTS[1:]
             + RUNNER_PULL_VARIANTS[1:]
+            + RUNNER_PUSH_VARIANTS[1:]
             + BE_POC_VARIANTS[1:]
+            + BE_PUSH_VARIANTS[1:]
+            + CHAMPION_NOFRI_VARIANTS
+            + ATR5_VARIANTS
         ),
     }
     # De-dupe by name, first wins (keeps control once in tp_study).
@@ -1071,7 +1207,9 @@ def main():
         "--family",
         choices=(
             "legacy", "static_tp1", "atr_tp1", "three_lot", "scale_out",
-            "vwap_filter", "runner_pull", "be_poc", "tp_study", "all",
+            "vwap_filter", "runner_pull", "runner_push", "be_poc",
+            "be_push", "champion", "champion_nofri", "atr5",
+            "tp_study", "all",
         ),
         default="legacy",
         help="variant family (default: legacy)",
@@ -1081,6 +1219,13 @@ def main():
         choices=("both", "touch", "trade_through"),
         default="both",
         help="which fill models to run",
+    )
+    ap.add_argument(
+        "--prop",
+        choices=("combine", "xfa"),
+        default="combine",
+        help="prop eval: combine=$3k target+$2k trailing MLL; "
+             "xfa=$2k trailing MLL lock@0, no profit target (survive)",
     )
     args = ap.parse_args()
 
@@ -1102,10 +1247,12 @@ def main():
         fill_models = ((1, "trade_through"),)
 
     need_atr = any(v.atr_mult > 0 for v in variants)
+    need_lookback = any(getattr(v, "atr_lookback_days", 0) > 0 for v in variants)
     need_vwap = any(v.vwap_sigma > 0 for v in variants)
     print(
         f"family={args.family} variants={len(variants)} "
-        f"sessions={len(sel)} atr={need_atr} vwap={need_vwap}",
+        f"sessions={len(sel)} atr={need_atr} lookback={need_lookback} "
+        f"vwap={need_vwap} prop={args.prop}",
         flush=True,
     )
 
@@ -1114,6 +1261,7 @@ def main():
         for _, fill in fill_models:
             buckets[f"{v.name}|{fill}"] = empty_bucket()
 
+    atr_history = []  # completed session mean ATR ticks (RTH trading days)
     started = time.perf_counter()
     for si, s in enumerate(sel, 1):
         day = s["date_eastern"]
@@ -1131,12 +1279,25 @@ def main():
         ee = timestamp_100ns(datetime.combine(date, ENTRY_END, tzinfo=EASTERN))
         fl = timestamp_100ns(datetime.combine(date, RTH_END, tzinfo=EASTERN))
 
-        poc, vah, val = rth_profile_for_session(prices, sizes, stamps)
-        atr = (
+        try:
+            poc, vah, val = rth_profile_for_session(prices, sizes, stamps)
+        except ValueError as exc:
+            print(f"[{si}/{len(sel)}] {day}  skip ({exc})", flush=True)
+            continue
+
+        need_intraday_atr = any(
+            v.atr_mult > 0 and int(getattr(v, "atr_lookback_days", 0) or 0) <= 0
+            for v in variants
+        )
+        day_atr = session_mean_atr_ticks(prices, stamps) if (
+            need_lookback or need_intraday_atr
+        ) else 0
+        atr_intraday = (
             atr_15m_ticks(prices, stamps)
-            if need_atr
+            if need_intraday_atr
             else np.zeros(len(prices), dtype=np.int32)
         )
+
         # Cache VWAP masks by (sigma, persist) so variants share work.
         vwap_cache = {}
 
@@ -1150,9 +1311,26 @@ def main():
                         prices, sizes, stamps,
                         sigma=key[0], persist_secs=key[1],
                     )
-                entry_ok = vwap_cache[key]
+                entry_ok = vwap_cache[key].copy()
             else:
                 entry_ok = np.ones(len(prices), dtype=np.int8)
+            if getattr(v, "no_friday", False) and date.weekday() == 4:
+                entry_ok[:] = 0
+
+            lookback_n = int(getattr(v, "atr_lookback_days", 0) or 0)
+            if v.atr_mult > 0 and lookback_n > 0:
+                if len(atr_history) < lookback_n:
+                    entry_ok[:] = 0
+                    atr = np.zeros(len(prices), dtype=np.int32)
+                else:
+                    look = int(round(float(np.mean(atr_history[-lookback_n:]))))
+                    atr = np.full(len(prices), look, dtype=np.int32)
+            elif v.atr_mult > 0:
+                atr = atr_intraday
+            else:
+                atr = np.zeros(len(prices), dtype=np.int32)
+
+            tp1_max = int(getattr(v, "tp1_max_ticks", 0) or 0) or TP1_MAX_TICKS
             for model, fill in fill_models:
                 trades, summary = simulate(
                     stamps, prices, poc, vah, val, day_ids,
@@ -1160,7 +1338,7 @@ def main():
                     v.stop_ticks, v.lots, v.tp1_ticks,
                     v.use_poc_rung, v.use_opp_rung, v.runner_ticks,
                     v.min_poc_dist, v.move_be, v.trail_ticks,
-                    atr, float(v.atr_mult), TP1_MIN_TICKS, TP1_MAX_TICKS,
+                    atr, float(v.atr_mult), TP1_MIN_TICKS, tp1_max,
                     int(v.tp2_ticks), 1 if v.tp2_at_poc else 0,
                     int(getattr(v, "tp1_lots", 1) or 1),
                     entry_ok,
@@ -1182,6 +1360,8 @@ def main():
                 b["net"] += dnet
                 b["dd"] = max(b["dd"], int(summary[4]))
                 b["days"].append((day, dnet, int(summary[4]), int(summary[5])))
+        if day_atr > 0:
+            atr_history.append(day_atr)
         print(f"[{si}/{len(sel)}] {day}", flush=True)
 
     equity_rows = []
@@ -1189,7 +1369,7 @@ def main():
     for key, b in buckets.items():
         n = b["trades"]
         name, fill = key.split("|")
-        pf = analyze_prop_firm(b["days"])
+        pf = analyze_prop_firm(b["days"], mode=args.prop)
         for day, dnet, cum_pnl, best_eod, eod_dd in pf["curve"]:
             equity_rows.append(dict(
                 variant=name, fill=fill, date=day,

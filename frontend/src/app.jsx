@@ -45,6 +45,9 @@ function App() {
   const [replayProgress, setReplayProgress] = useState(null);
   const [soundOn, setSoundOn] = useState(true);
   const [topstepSession, setTopstepSession] = useState(null);
+  const [atrInfo, setAtrInfo] = useState(null);
+  const [atrInput, setAtrInput] = useState('');
+  const [atrSaving, setAtrSaving] = useState(false);
   const wsRef = useRef(null);
   const soundOnRef = useRef(true);
 
@@ -91,15 +94,75 @@ function App() {
     };
   }, [connected]);
 
+  useEffect(() => {
+    if (!connected) return undefined;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/strategy/atr-lookback');
+        const data = await res.json();
+        if (cancelled || !data.success) return;
+        setAtrInfo(data);
+        if (data.manual_pts != null) {
+          setAtrInput(String(data.manual_pts));
+        }
+      } catch {
+        // Backend may not be up yet
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [connected]);
+
   const showToast = (message, error = false) => {
     setToast({ message, error });
     window.setTimeout(() => setToast(null), 4000);
+  };
+
+  const saveAtrLookback = async (clear = false) => {
+    setAtrSaving(true);
+    try {
+      const body = clear ? { atr_pts: null } : { atr_pts: Number(atrInput) };
+      if (!clear && (!Number.isFinite(body.atr_pts) || body.atr_pts <= 0)) {
+        showToast('Enter a 5d ATR in points (> 0)', true);
+        return;
+      }
+      const res = await fetch('/api/strategy/atr-lookback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!data.success) {
+        showToast(data.error || 'ATR update failed', true);
+        return;
+      }
+      setAtrInfo(data);
+      if (data.status) setStatus(data.status);
+      if (clear) setAtrInput('');
+      else setAtrInput(String(data.atr_pts));
+      const pts = data.atr_pts;
+      const tp1 = data.tp1_pts;
+      showToast(
+        pts == null
+          ? '5d ATR cleared'
+          : `5d ATR ${Number(pts).toFixed(2)} pt → TP1 ${Number(tp1 || 0).toFixed(2)} pt`
+      );
+    } catch (e) {
+      showToast(String(e.message || e), true);
+    } finally {
+      setAtrSaving(false);
+    }
   };
 
   const handleMessage = (msg) => {
     switch (msg.type) {
       case 'tick':
         setStatus(msg.status);
+        if (msg.status?.atr) {
+          setAtrInfo(msg.status.atr);
+        }
         if (msg.status?.topstep_session) {
           setTopstepSession(msg.status.topstep_session);
         }
@@ -174,6 +237,27 @@ function App() {
       case 'runner_update':
         if (msg.status) {
           setStatus(msg.status);
+        }
+        if (msg.message) {
+          showToast(msg.message, msg.success === false);
+        }
+        break;
+      case 'atr_lookback':
+        if (msg.status) {
+          setStatus(msg.status);
+          if (msg.status.atr) setAtrInfo(msg.status.atr);
+        }
+        if (msg.atr_pts !== undefined) {
+          setAtrInfo((prev) => ({
+            ...(prev || {}),
+            manual_pts: msg.atr_pts,
+            lookback_pts: msg.atr_pts,
+            tp1_pts: msg.tp1_pts,
+            source: msg.atr_pts == null ? 'none' : 'manual',
+            warm: msg.tp1_pts != null,
+          }));
+          if (msg.atr_pts == null) setAtrInput('');
+          else setAtrInput(String(msg.atr_pts));
         }
         if (msg.message) {
           showToast(msg.message, msg.success === false);
@@ -423,6 +507,49 @@ function App() {
               Seeds today&apos;s VA from history, then streams live MNQ. All session rules are Eastern.
             </p>
           )}
+
+          <div className="atr-row">
+            <label
+              className="atr-label"
+              title="Mean of prior 5 sessions' ATR(14) on 15-minute RTH bars, in points"
+            >
+              5d ATR (pts)
+              <input
+                type="number"
+                step="0.25"
+                min="0"
+                placeholder="e.g. 55"
+                value={atrInput}
+                onChange={(e) => setAtrInput(e.target.value)}
+                disabled={!connected || atrSaving}
+              />
+            </label>
+            <button
+              type="button"
+              className="btn btn-ghost"
+              onClick={() => saveAtrLookback(false)}
+              disabled={!connected || atrSaving}
+            >
+              {atrSaving ? 'Saving…' : 'Apply'}
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost"
+              onClick={() => saveAtrLookback(true)}
+              disabled={!connected || atrSaving || atrInfo?.manual_pts == null}
+              title="Clear manual override"
+            >
+              Clear
+            </button>
+            <span className="atr-hint">
+              ATR(14) · 15m RTH · TP1 = 0.75×
+              {atrInfo?.tp1_pts != null
+                ? ` → ${Number(atrInfo.tp1_pts).toFixed(1)} pt`
+                : status?.atr?.tp1_pts != null
+                  ? ` → ${Number(status.atr.tp1_pts).toFixed(1)} pt`
+                  : ' (enter to size TP1)'}
+            </span>
+          </div>
         </div>
 
         {!running ? (
@@ -838,6 +965,7 @@ function RuleIndicators({ status }) {
   const triggerPrice = status.trigger_price;
   const lastPrice = status.last_price;
   const canEnter = !!status.can_enter;
+  const atr = status.atr || {};
 
   let armDetail = 'Waiting for POC cross to arm';
   if (inPosition) {
@@ -854,6 +982,17 @@ function RuleIndicators({ status }) {
     armed && lastPrice != null && triggerPrice != null
       ? `Last ${lastPrice.toFixed(2)} · trigger ${triggerPrice.toFixed(2)}`
       : null;
+
+  const tp1Label =
+    atr.tp1_pts != null ? `TP1 ${Number(atr.tp1_pts).toFixed(1)} pt` : 'TP1 —';
+  const atrSource =
+    atr.source === 'manual'
+      ? 'manual'
+      : atr.source === 'history'
+        ? 'auto history'
+        : atr.source === 'static'
+          ? 'static'
+          : 'need ATR';
 
   return (
     <section className="panel rules-panel">
@@ -872,7 +1011,12 @@ function RuleIndicators({ status }) {
         <RulePill
           label="Entry window"
           on={!!status.entry_window_open}
-          hint="10:15–15:00 ET"
+          hint={
+            status.friday_blocked
+              ? 'Blocked: no Friday entries'
+              : '10:15–15:00 ET'
+          }
+          warn={!!status.friday_blocked}
         />
         <RulePill
           label="RTH"
@@ -896,6 +1040,12 @@ function RuleIndicators({ status }) {
           on={status.poc_distance_ok === true}
           muted={status.poc_distance_ok == null}
           hint="VA line must be ≥30 pts from POC"
+        />
+        <RulePill
+          label={tp1Label}
+          on={!!atr.warm}
+          muted={!atr.warm}
+          hint={`ATR(14) on 15m RTH · mean prior 5 days × 0.75 · ${atrSource}`}
         />
         <RulePill
           label={brokerLabel(status.broker)}

@@ -23,9 +23,17 @@ class Settings(BaseSettings):
     topstep_enable_orders: bool = True
 
     # Strategy parameters (can also come from env)
+    # Champion: ATR5×0.75 TP1 + BE@TP1 + opp VA +25pt + no Friday
     stop_ticks: int = 240   # 60 points
     lots: int = 2
-    tp1_ticks: int = 160    # 40 points
+    tp1_ticks: int = 160    # fallback when ATR sizing off / not warm
+    move_be: bool = True
+    opp_pull_ticks: int = -100  # negative = push beyond opp VA (25pt)
+    no_friday: bool = True
+    atr_mult: float = 0.75
+    atr_lookback_days: int = 5
+    tp1_min_ticks: int = 60   # 15 points
+    tp1_max_ticks: int = 400  # 100 points
 
 
 settings = Settings()
