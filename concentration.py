@@ -37,12 +37,20 @@ def run(selected, variant, sessions_dir):
         fl = timestamp_100ns(datetime.combine(date, RTH_END, tzinfo=EASTERN))
         poc, vah, val = rth_profile_for_session(prices, sizes, stamps)
 
+        atr = np.zeros(len(prices), dtype=np.int32)
         trades, _ = simulate(
             stamps, prices, poc, vah, val, day_ids,
             es, ee, fl, 0,
             variant.stop_ticks, variant.lots, variant.tp1_ticks,
             variant.use_poc_rung, variant.use_opp_rung,
             variant.runner_ticks, variant.min_poc_dist, variant.move_be,
+            getattr(variant, "trail_ticks", 0),
+            atr, float(getattr(variant, "atr_mult", 0.0)),
+            60, 200,
+            int(getattr(variant, "tp2_ticks", 0)),
+            1 if getattr(variant, "tp2_at_poc", False) else 0,
+            int(getattr(variant, "tp1_lots", 1) or 1),
+            np.ones(len(prices), dtype=np.int8),
         )
         for t in trades:
             legs = sum(1 for k in range(MAX_LOTS) if t[LEG_T0 + k] >= 0)

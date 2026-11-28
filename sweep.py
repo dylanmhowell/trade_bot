@@ -69,51 +69,132 @@ class Variant:
     trail_ticks: int = 0        # 0 = off; activates after TP1 fills
     entry_hour: int = 10
     entry_minute: int = 15
+    atr_mult: float = 0.0       # >0 → TP1 = clamp(ATR15 * mult) in ticks
+    tp2_ticks: int = 0          # offset beyond TP1 for lot 2 (3-lot family)
+    tp2_at_poc: bool = False    # lot 2 targets developing POC instead
+    tp1_lots: int = 1           # how many lots share the TP1 price (rest → runner)
+    # Block new entries when price is outside session VWAP ± sigma*stdev
+    # (trend/impulse filter). persist_secs=0 → check at signal only;
+    # >0 → must have been outside continuously for that long.
+    vwap_sigma: float = 0.0
+    vwap_persist_secs: int = 0
+    family: str = "legacy"
     note: str = ""
 
 
-VARIANTS = [
+def _k60(**kw):
+    """K_two_lot_60 base: 2 lots, opp-VA runner, 60pt stop."""
+    base = dict(
+        stop_ticks=240, lots=2, tp1_ticks=80,
+        use_poc_rung=False, use_opp_rung=True, runner_ticks=0,
+    )
+    base.update(kw)
+    return Variant(**base)
+
+
+LEGACY_VARIANTS = [
     Variant("A_control", stop_ticks=120, lots=2, tp1_ticks=80,
             use_poc_rung=False, use_opp_rung=True, runner_ticks=320,
+            family="legacy",
             note="baseline control, no breakeven, 10:15 entry"),
     Variant("O_be_30", stop_ticks=120, lots=2, tp1_ticks=80,
             use_poc_rung=False, use_opp_rung=True, runner_ticks=320,
-            move_be=True, note="A + breakeven after TP1"),
+            move_be=True, family="legacy", note="A + breakeven after TP1"),
     Variant("P_late_30", stop_ticks=120, lots=2, tp1_ticks=80,
             use_poc_rung=False, use_opp_rung=True, runner_ticks=320,
-            entry_hour=11, entry_minute=0, note="A + 11:00 entry floor"),
+            entry_hour=11, entry_minute=0, family="legacy",
+            note="A + 11:00 entry floor"),
     Variant("Q_be_late_30", stop_ticks=120, lots=2, tp1_ticks=80,
             use_poc_rung=False, use_opp_rung=True, runner_ticks=320,
-            move_be=True, entry_hour=11, entry_minute=0,
+            move_be=True, entry_hour=11, entry_minute=0, family="legacy",
             note="A + breakeven + 11:00 floor"),
-    Variant("K_two_lot_60", stop_ticks=240, lots=2, tp1_ticks=80,
-            use_poc_rung=False, use_opp_rung=True, runner_ticks=0,
-            note="2 lots: TP1 20pt banked, 1 lot to opp VA edge, 60pt stop"),
-    Variant("R_be_60", stop_ticks=240, lots=2, tp1_ticks=80,
-            use_poc_rung=False, use_opp_rung=True, runner_ticks=0,
-            move_be=True, note="K + breakeven after TP1"),
-    Variant("S_be_late_60", stop_ticks=240, lots=2, tp1_ticks=80,
-            use_poc_rung=False, use_opp_rung=True, runner_ticks=0,
-            move_be=True, entry_hour=11, entry_minute=0,
-            note="K + breakeven + 11:00 floor"),
-    # Trailing stop variants
-    Variant("T_trail20_60", stop_ticks=240, lots=2, tp1_ticks=80,
-            use_poc_rung=False, use_opp_rung=True, runner_ticks=0,
-            trail_ticks=80,
-            note="K + 20pt trail after TP1 (locks BE at TP1)"),
-    Variant("U_trail30_60", stop_ticks=240, lots=2, tp1_ticks=80,
-            use_poc_rung=False, use_opp_rung=True, runner_ticks=0,
-            trail_ticks=120,
-            note="K + 30pt trail after TP1 (tightens to -10pt at TP1)"),
-    Variant("V_be_trail30_60", stop_ticks=240, lots=2, tp1_ticks=80,
-            use_poc_rung=False, use_opp_rung=True, runner_ticks=0,
-            move_be=True, trail_ticks=120,
-            note="K + BE at TP1, then 30pt trail once > +30pt"),
-    Variant("W_be_trail40_60", stop_ticks=240, lots=2, tp1_ticks=80,
-            use_poc_rung=False, use_opp_rung=True, runner_ticks=0,
-            move_be=True, trail_ticks=160,
-            note="K + BE at TP1, then 40pt trail once > +40pt"),
+    _k60(name="K_two_lot_60", family="legacy",
+         note="2 lots: TP1 20pt banked, 1 lot to opp VA edge, 60pt stop"),
+    _k60(name="R_be_60", move_be=True, family="legacy",
+         note="K + breakeven after TP1"),
+    _k60(name="S_be_late_60", move_be=True, entry_hour=11, entry_minute=0,
+         family="legacy", note="K + breakeven + 11:00 floor"),
+    _k60(name="T_trail20_60", trail_ticks=80, family="legacy",
+         note="K + 20pt trail after TP1 (locks BE at TP1)"),
+    _k60(name="U_trail30_60", trail_ticks=120, family="legacy",
+         note="K + 30pt trail after TP1 (tightens to -10pt at TP1)"),
+    _k60(name="V_be_trail30_60", move_be=True, trail_ticks=120, family="legacy",
+         note="K + BE at TP1, then 30pt trail once > +30pt"),
+    _k60(name="W_be_trail40_60", move_be=True, trail_ticks=160, family="legacy",
+         note="K + BE at TP1, then 40pt trail once > +40pt"),
 ]
+
+# Static TP1 plateau on K base (points → ticks = pts * 4)
+STATIC_TP1_VARIANTS = [
+    _k60(name="K_two_lot_60", family="static_tp1",
+         note="control: TP1 20pt"),
+] + [
+    _k60(name=f"TP1_{pts}pt", tp1_ticks=pts * 4, family="static_tp1",
+         note=f"K base, static TP1 {pts}pt")
+    for pts in (15, 20, 25, 30, 35, 40, 45, 50)
+]
+
+# ATR(14) on 15-minute RTH bars → TP1 = clamp(k * ATR, 15..50 pt)
+ATR_TP1_VARIANTS = [
+    _k60(name="K_two_lot_60", family="atr_tp1",
+         note="control: fixed TP1 20pt"),
+] + [
+    _k60(name=f"ATR15_x{str(k).replace('.', 'p')}", atr_mult=float(k),
+         family="atr_tp1",
+         note=f"TP1 = clamp({k}×ATR(14,15m), 15–50pt); skip entry until ATR warm")
+    for k in (0.5, 0.75, 1.0, 1.25, 1.5)
+]
+
+# 3 MNQ: TP1=20, TP2 = offset past TP1 or POC, TP3 = opp VA
+THREE_LOT_VARIANTS = [
+    _k60(name="K_two_lot_60", family="three_lot",
+         note="2-lot control for comparison"),
+] + [
+    _k60(name=f"L3_tp2_{pts}pt", lots=3, tp1_ticks=80, tp2_ticks=pts * 4,
+         family="three_lot",
+         note=f"3 lots: TP1 20pt, TP2 +{pts}pt past TP1, TP3 opp VA")
+    for pts in (10, 15, 20, 25, 30)
+] + [
+    _k60(name="L3_tp2_poc", lots=3, tp1_ticks=80, tp2_at_poc=True,
+         family="three_lot",
+         note="3 lots: TP1 20pt, TP2 at POC, TP3 opp VA"),
+]
+
+# Scale-out: N lots at TP1, 1 runner to opp VA
+SCALE_OUT_VARIANTS = [
+    _k60(name="TP1_40pt", tp1_ticks=160, family="scale_out",
+         note="2-lot control: 1×40pt + opp VA"),
+    _k60(name="L3_2x40_opp", lots=3, tp1_ticks=160, tp1_lots=2,
+         family="scale_out",
+         note="3 lots: 2 off at 40pt, 1 to opp VA"),
+    _k60(name="L3_2x20_opp", lots=3, tp1_ticks=80, tp1_lots=2,
+         family="scale_out",
+         note="3 lots: 2 off at 20pt, 1 to opp VA"),
+    _k60(name="L3_2x45_opp", lots=3, tp1_ticks=180, tp1_lots=2,
+         family="scale_out",
+         note="3 lots: 2 off at 45pt, 1 to opp VA"),
+]
+
+# VWAP ± 2σ impulse filter on the 40pt plateau candidate
+VWAP_FILTER_VARIANTS = [
+    _k60(name="TP1_40pt", tp1_ticks=160, family="vwap_filter",
+         note="control: TP1 40pt, no VWAP filter"),
+    _k60(name="TP1_40_vwap2", tp1_ticks=160, vwap_sigma=2.0,
+         family="vwap_filter",
+         note="TP1 40pt; block entry if price outside VWAP±2σ at signal"),
+    _k60(name="TP1_40_vwap2_5m", tp1_ticks=160, vwap_sigma=2.0,
+         vwap_persist_secs=300, family="vwap_filter",
+         note="TP1 40pt; block while outside VWAP±2σ for ≥5 minutes"),
+    _k60(name="TP1_40_vwap2_15m", tp1_ticks=160, vwap_sigma=2.0,
+         vwap_persist_secs=900, family="vwap_filter",
+         note="TP1 40pt; block while outside VWAP±2σ for ≥15 minutes"),
+]
+
+VARIANTS = LEGACY_VARIANTS
+TP1_MIN_TICKS = 60    # 15 points
+TP1_MAX_TICKS = 200   # 50 points
+ATR_LEN = 14
+ATR_BAR_MINUTES = 15
 
 FILL_MODELS = ((0, "touch"), (1, "trade_through"))
 
@@ -137,6 +218,166 @@ def price_text(ticks):
 
 def eastern_day_id(stamp):
     return from_100ns(stamp).astimezone(EASTERN).date().toordinal()
+
+
+@njit(cache=True)
+def _vwap_entry_ok_core(prices, sizes, stamps, rth_mask, sigma, persist_ns):
+    """Numba core for session VWAP ± sigma filter. rth_mask: 1 during RTH."""
+    n = len(prices)
+    ok = np.ones(n, np.int8)
+    sum_v = 0.0
+    sum_pv = 0.0
+    sum_p2v = 0.0
+    outside_since = np.int64(-1)
+    for i in range(n):
+        if rth_mask[i] == 0:
+            ok[i] = 1
+            outside_since = np.int64(-1)
+            continue
+        px = float(prices[i])
+        vol = float(sizes[i]) if sizes[i] > 0 else 1.0
+        sum_v += vol
+        sum_pv += px * vol
+        sum_p2v += px * px * vol
+        if sum_v <= 0.0:
+            ok[i] = 1
+            continue
+        vwap = sum_pv / sum_v
+        var = sum_p2v / sum_v - vwap * vwap
+        if var < 0.0:
+            var = 0.0
+        std = var ** 0.5
+        if std <= 0.0:
+            ok[i] = 1
+            outside_since = np.int64(-1)
+            continue
+        outside = abs(px - vwap) > (sigma * std)
+        if not outside:
+            outside_since = np.int64(-1)
+            ok[i] = 1
+            continue
+        stamp = stamps[i]
+        if outside_since < 0:
+            outside_since = stamp
+        fired = 1 if persist_ns <= 0 else (
+            1 if (stamp - outside_since) >= persist_ns else 0
+        )
+        ok[i] = 0 if fired == 1 else 1
+    return ok
+
+
+def session_vwap_entry_ok(prices, sizes, stamps, sigma=2.0, persist_secs=0):
+    """Allow-entry mask from developing RTH session VWAP ± sigma*stdev.
+
+    Returns int8 array: 1 = may enter, 0 = block (price treated as impulsive /
+    trending relative to session VWAP). Variance is volume-weighted.
+    persist_secs > 0 requires a continuous outside-band streak at least that long
+    (using tick timestamps); 0 means check the signal tick only.
+    """
+    n = len(prices)
+    if n == 0 or sigma <= 0:
+        return np.ones(n, dtype=np.int8)
+
+    # Build RTH mask once (Eastern wall clock).
+    rth_mask = np.zeros(n, dtype=np.int8)
+    for i, stamp in enumerate(stamps):
+        t = from_100ns(int(stamp)).astimezone(EASTERN).time()
+        if RTH_START <= t < RTH_END:
+            rth_mask[i] = 1
+
+    persist_ns = int(persist_secs) * 10_000_000
+    return _vwap_entry_ok_core(
+        np.ascontiguousarray(prices, dtype=np.int32),
+        np.ascontiguousarray(sizes, dtype=np.int64),
+        np.ascontiguousarray(stamps, dtype=np.int64),
+        rth_mask,
+        float(sigma),
+        np.int64(persist_ns),
+    )
+
+
+def atr_15m_ticks(prices, stamps, length=ATR_LEN, bar_minutes=ATR_BAR_MINUTES):
+    """Wilder ATR(length) on completed Eastern bar_minutes bars, forward-filled.
+
+    Returns int32 ticks (quarter-points). 0 until `length` bars have closed.
+    Only RTH ticks (09:30–16:00 ET) contribute to bars.
+    """
+    n = len(prices)
+    out = np.zeros(n, dtype=np.int32)
+    if n == 0:
+        return out
+
+    # bucket_id -> [high, low, close] in ticks; build in time order
+    buckets = {}
+    order = []
+    bar_ns = bar_minutes * 60 * 10_000_000
+    for i in range(n):
+        et = from_100ns(int(stamps[i])).astimezone(EASTERN)
+        t = et.time()
+        if t < RTH_START or t >= RTH_END:
+            continue
+        # Floor to bar_minutes within the Eastern local day.
+        minute_of_day = et.hour * 60 + et.minute
+        floored = (minute_of_day // bar_minutes) * bar_minutes
+        # Unique key: ordinal day + floored minute
+        key = et.toordinal() * 10_000 + floored
+        px = int(prices[i])
+        if key not in buckets:
+            buckets[key] = [px, px, px]
+            order.append(key)
+        else:
+            h, l, _ = buckets[key]
+            if px > h:
+                h = px
+            if px < l:
+                l = px
+            buckets[key] = [h, l, px]
+
+    if not order:
+        return out
+
+    # Wilder ATR on completed bars
+    atr_by_key = {}
+    prev_close = None
+    atr = None
+    trs = []
+    for key in order:
+        h, l, c = buckets[key]
+        if prev_close is None:
+            tr = h - l
+        else:
+            tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
+        trs.append(tr)
+        if len(trs) < length:
+            atr_by_key[key] = 0
+        elif len(trs) == length:
+            atr = sum(trs) / float(length)
+            atr_by_key[key] = int(round(atr))
+        else:
+            atr = (atr * (length - 1) + tr) / float(length)
+            atr_by_key[key] = int(round(atr))
+        prev_close = c
+
+    # Map each tick to ATR of the last *completed* bar (not the forming one).
+    bar_ends = []
+    for key in order:
+        day_ord, floored = divmod(key, 10_000)
+        d = datetime.fromordinal(day_ord).date()
+        hh, mm = divmod(floored, 60)
+        start = timestamp_100ns(
+            datetime.combine(d, clock(hh, mm), tzinfo=EASTERN)
+        )
+        bar_ends.append((start + bar_ns, atr_by_key[key]))
+
+    last_atr = 0
+    j = 0
+    for i in range(n):
+        stamp = int(stamps[i])
+        while j < len(bar_ends) and stamp >= bar_ends[j][0]:
+            last_atr = bar_ends[j][1]
+            j += 1
+        out[i] = last_atr
+    return out
 
 
 # ---------------------------------------------------------- profile building
@@ -254,7 +495,9 @@ def simulate(timestamps, prices, poc, vah, val_area, day_ids,
              entry_start, entry_end, flush_instant, execution_model,
              stop_ticks, lots, tp1_ticks,
              use_poc_rung, use_opp_rung, runner_ticks,
-             min_poc_dist, move_be, trail_ticks):
+             min_poc_dist, move_be, trail_ticks,
+             atr_ticks, atr_mult, tp1_min_ticks, tp1_max_ticks,
+             tp2_ticks, tp2_at_poc, tp1_lots, entry_ok):
     n = len(prices)
 
     trades = np.full((MAX_TRADES, STAT0 + 6), -1, np.int64)
@@ -436,6 +679,23 @@ def simulate(timestamps, prices, poc, vah, val_area, day_ids,
                     trig = cvah if is_short else cval
 
                     if abs(cpoc - trig) >= min_poc_dist:
+                        # Impulse / trend filter (session VWAP ± σ bands).
+                        if entry_ok[i] == 0:
+                            continue
+                        # Resolve TP1: static ticks, or ATR multiple when warm.
+                        eff_tp1 = tp1_ticks
+                        if atr_mult > 0.0:
+                            a = int(atr_ticks[i])
+                            if a <= 0:
+                                # ATR not warm yet — skip this cross; stay armed.
+                                continue
+                            raw = int(round(a * atr_mult))
+                            if raw < tp1_min_ticks:
+                                raw = tp1_min_ticks
+                            if raw > tp1_max_ticks:
+                                raw = tp1_max_ticks
+                            eff_tp1 = raw
+
                         entered = 1
                         position = -1 if is_short else 1
                         entry = cand
@@ -454,21 +714,25 @@ def simulate(timestamps, prices, poc, vah, val_area, day_ids,
                         tp1_hit, best_price = 0, 0
 
                         ptarget = entry
+                        n_tp1 = tp1_lots if tp1_lots > 0 else 1
+                        if n_tp1 > lots:
+                            n_tp1 = lots
                         for k in range(lots):
                             rp, kind = 0, -1
-                            if k == 0:
-                                if tp1_ticks > 0:
-                                    rp = entry + position * tp1_ticks
-                                    kind = RUNG_TP1
-                                elif use_opp_rung:
-                                    rp = cval if position == -1 else cvah
-                                    kind = RUNG_OPP
-                                else:
-                                    break
-                            elif k == 1 and use_poc_rung:
+                            if k < n_tp1 and eff_tp1 > 0:
+                                # One or more lots share the same TP1 price.
+                                rp = entry + position * eff_tp1
+                                kind = RUNG_TP1
+                            elif k == n_tp1 and tp2_at_poc == 1:
                                 rp, kind = cpoc, RUNG_POC
-                            elif ((k >= 1 and use_poc_rung and use_opp_rung)
-                                  or (k == 1 and use_opp_rung)):
+                            elif k == n_tp1 and tp2_ticks > 0:
+                                rp = entry + position * (eff_tp1 + tp2_ticks)
+                                kind = RUNG_FIXED
+                            elif k == n_tp1 and use_poc_rung:
+                                rp, kind = cpoc, RUNG_POC
+                            elif use_opp_rung and (
+                                    k >= n_tp1
+                                    or (k >= 1 and use_poc_rung)):
                                 rp = cval if position == -1 else cvah
                                 kind = RUNG_OPP
                             elif runner_ticks > 0:
@@ -478,7 +742,12 @@ def simulate(timestamps, prices, poc, vah, val_area, day_ids,
                                 break
 
                             gap = (rp - ptarget) * position
-                            if gap < MIN_RUNG_GAP_TICKS:
+                            # Allow multiple lots at the exact same TP1.
+                            same_tp1 = (
+                                kind == RUNG_TP1 and gap == 0 and legs > 0
+                                and leg_kind[legs - 1] == RUNG_TP1
+                            )
+                            if gap < MIN_RUNG_GAP_TICKS and not same_tp1:
                                 if runner_ticks > 0 and kind == RUNG_OPP:
                                     rp = entry + position * runner_ticks
                                     kind = RUNG_FIXED
@@ -661,6 +930,82 @@ def analyze_prop_firm(
     }
 
 
+def select_variants(family: str | None, only: list[str] | None):
+    catalog = {
+        "legacy": LEGACY_VARIANTS,
+        "static_tp1": STATIC_TP1_VARIANTS,
+        "atr_tp1": ATR_TP1_VARIANTS,
+        "three_lot": THREE_LOT_VARIANTS,
+        "scale_out": SCALE_OUT_VARIANTS,
+        "vwap_filter": VWAP_FILTER_VARIANTS,
+        "tp_study": (
+            STATIC_TP1_VARIANTS + ATR_TP1_VARIANTS[1:] + THREE_LOT_VARIANTS[1:]
+            + SCALE_OUT_VARIANTS[1:]
+        ),
+        "all": (
+            LEGACY_VARIANTS
+            + STATIC_TP1_VARIANTS[1:]
+            + ATR_TP1_VARIANTS[1:]
+            + THREE_LOT_VARIANTS[1:]
+            + SCALE_OUT_VARIANTS[1:]
+            + VWAP_FILTER_VARIANTS[1:]
+        ),
+    }
+    # De-dupe by name, first wins (keeps control once in tp_study).
+    if family:
+        if family not in catalog:
+            raise SystemExit(
+                f"unknown family {family!r}; choose from {sorted(catalog)}"
+            )
+        raw = catalog[family]
+    else:
+        raw = LEGACY_VARIANTS
+    seen = set()
+    variants = []
+    for v in raw:
+        if v.name in seen:
+            continue
+        seen.add(v.name)
+        variants.append(v)
+    if only:
+        wanted = set(only)
+        variants = [v for v in variants if v.name in wanted]
+        if not variants:
+            names = ", ".join(sorted(seen) or [v.name for v in LEGACY_VARIANTS])
+            raise SystemExit(f"no variants matched {only}\navailable: {names}")
+    return variants
+
+
+def neighbor_median_report(rows, family_prefix_pts):
+    """Plateau check for static TP1_*pt variants (touch fill)."""
+    by_pts = {}
+    for r in rows:
+        if r["fill"] != "touch":
+            continue
+        name = r["variant"]
+        if name.startswith("TP1_") and name.endswith("pt"):
+            try:
+                pts = int(name[4:-2])
+            except ValueError:
+                continue
+            by_pts[pts] = r["net_dollars"]
+        elif name == "K_two_lot_60":
+            by_pts[20] = r["net_dollars"]  # control lands on 20pt cell
+    if len(by_pts) < 3:
+        return
+    pts_sorted = sorted(by_pts)
+    print("\nstatic TP1 plateau (touch net $, neighbor median):")
+    print(f"{'pts':>5}{'net':>12}{'nbr_med':>12}")
+    for i, pts in enumerate(pts_sorted):
+        nets = [by_pts[pts]]
+        if i > 0:
+            nets.append(by_pts[pts_sorted[i - 1]])
+        if i + 1 < len(pts_sorted):
+            nets.append(by_pts[pts_sorted[i + 1]])
+        med = float(np.median(nets))
+        print(f"{pts:>5}{by_pts[pts]:>12,.2f}{med:>12,.2f}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sessions", type=Path, default=Path("output/sessions"))
@@ -668,6 +1013,21 @@ def main():
     ap.add_argument("--limit", type=int)
     ap.add_argument("--only", nargs="*",
                     help="variant names to run, e.g. O_be_30")
+    ap.add_argument(
+        "--family",
+        choices=(
+            "legacy", "static_tp1", "atr_tp1", "three_lot", "scale_out",
+            "vwap_filter", "tp_study", "all",
+        ),
+        default="legacy",
+        help="variant family (default: legacy)",
+    )
+    ap.add_argument(
+        "--fill",
+        choices=("both", "touch", "trade_through"),
+        default="both",
+        help="which fill models to run",
+    )
     args = ap.parse_args()
 
     sel = load_sessions(args.sessions / "manifest.json", args.limit)
@@ -680,17 +1040,24 @@ def main():
         raise SystemExit(f"self-test failed: {self_test()}")
     print("self-test passed\n", flush=True)
 
-    variants = VARIANTS
-    if args.only:
-        wanted = set(args.only)
-        variants = [v for v in VARIANTS if v.name in wanted]
-        if not variants:
-            names = ", ".join(v.name for v in VARIANTS)
-            raise SystemExit(f"no variants matched {args.only}\navailable: {names}")
+    variants = select_variants(args.family, args.only)
+    fill_models = FILL_MODELS
+    if args.fill == "touch":
+        fill_models = ((0, "touch"),)
+    elif args.fill == "trade_through":
+        fill_models = ((1, "trade_through"),)
+
+    need_atr = any(v.atr_mult > 0 for v in variants)
+    need_vwap = any(v.vwap_sigma > 0 for v in variants)
+    print(
+        f"family={args.family} variants={len(variants)} "
+        f"sessions={len(sel)} atr={need_atr} vwap={need_vwap}",
+        flush=True,
+    )
 
     buckets = {}
     for v in variants:
-        for _, fill in FILL_MODELS:
+        for _, fill in fill_models:
             buckets[f"{v.name}|{fill}"] = empty_bucket()
 
     started = time.perf_counter()
@@ -711,17 +1078,38 @@ def main():
         fl = timestamp_100ns(datetime.combine(date, RTH_END, tzinfo=EASTERN))
 
         poc, vah, val = rth_profile_for_session(prices, sizes, stamps)
+        atr = (
+            atr_15m_ticks(prices, stamps)
+            if need_atr
+            else np.zeros(len(prices), dtype=np.int32)
+        )
+        # Cache VWAP masks by (sigma, persist) so variants share work.
+        vwap_cache = {}
 
         for v in variants:
             es = timestamp_100ns(datetime.combine(
                 date, clock(v.entry_hour, v.entry_minute), tzinfo=EASTERN))
-            for model, fill in FILL_MODELS:
+            if v.vwap_sigma > 0:
+                key = (float(v.vwap_sigma), int(v.vwap_persist_secs))
+                if key not in vwap_cache:
+                    vwap_cache[key] = session_vwap_entry_ok(
+                        prices, sizes, stamps,
+                        sigma=key[0], persist_secs=key[1],
+                    )
+                entry_ok = vwap_cache[key]
+            else:
+                entry_ok = np.ones(len(prices), dtype=np.int8)
+            for model, fill in fill_models:
                 trades, summary = simulate(
                     stamps, prices, poc, vah, val, day_ids,
                     es, ee, fl, model,
                     v.stop_ticks, v.lots, v.tp1_ticks,
                     v.use_poc_rung, v.use_opp_rung, v.runner_ticks,
                     v.min_poc_dist, v.move_be, v.trail_ticks,
+                    atr, float(v.atr_mult), TP1_MIN_TICKS, TP1_MAX_TICKS,
+                    int(v.tp2_ticks), 1 if v.tp2_at_poc else 0,
+                    int(getattr(v, "tp1_lots", 1) or 1),
+                    entry_ok,
                 )
                 b = buckets[f"{v.name}|{fill}"]
                 dnet = 0
@@ -800,26 +1188,44 @@ def main():
         wr.writerows(equity_rows)
 
     print("\n" + "=" * 106)
-    print(f"{'variant':<18}{'touch net':>11}{'t/t net':>11}{'trades':>7}"
-          f"{'win%':>7}{'PF':>6}{'dayDD':>9}{'eodDD':>9}{'eval_d1':>12}{'pass%':>8}")
+    has_tt = any(r["fill"] == "trade_through" for r in rows)
+    if has_tt:
+        print(f"{'variant':<18}{'touch net':>11}{'t/t net':>11}{'trades':>7}"
+              f"{'win%':>7}{'PF':>6}{'dayDD':>9}{'eodDD':>9}{'eval_d1':>12}{'pass%':>8}")
+    else:
+        print(f"{'variant':<18}{'net':>11}{'trades':>7}"
+              f"{'win%':>7}{'PF':>6}{'dayDD':>9}{'eodDD':>9}{'eval_d1':>12}{'pass%':>8}")
     print("-" * 106)
     by_var = {}
     for r in rows:
         by_var.setdefault(r["variant"], {})[r["fill"]] = r
     for v in variants:
-        t = by_var[v.name]["touch"]
-        tt = by_var[v.name]["trade_through"]
+        fills = by_var[v.name]
+        t = fills.get("touch") or next(iter(fills.values()))
         pr = f"{t['pass_rate'] * 100:.1f}%" if t["pass_rate"] is not None else "n/a"
-        print(f"{v.name:<18}{t['net_dollars']:>11,.2f}"
-              f"{tt['net_dollars']:>11,.2f}"
-              f"{t['trades']:>7}"
-              f"{(t['win_rate'] or 0) * 100:>6.1f}%"
-              f"{(t['profit_factor'] or 0):>6.2f}"
-              f"{t['max_daily_dd']:>9,.2f}"
-              f"{t['max_eod_dd']:>9,.2f}"
-              f"{t['eval_d1']:>12}"
-              f"{pr:>8}")
+        if has_tt:
+            tt = fills.get("trade_through", t)
+            print(f"{v.name:<18}{t['net_dollars']:>11,.2f}"
+                  f"{tt['net_dollars']:>11,.2f}"
+                  f"{t['trades']:>7}"
+                  f"{(t['win_rate'] or 0) * 100:>6.1f}%"
+                  f"{(t['profit_factor'] or 0):>6.2f}"
+                  f"{t['max_daily_dd']:>9,.2f}"
+                  f"{t['max_eod_dd']:>9,.2f}"
+                  f"{t['eval_d1']:>12}"
+                  f"{pr:>8}")
+        else:
+            print(f"{v.name:<18}{t['net_dollars']:>11,.2f}"
+                  f"{t['trades']:>7}"
+                  f"{(t['win_rate'] or 0) * 100:>6.1f}%"
+                  f"{(t['profit_factor'] or 0):>6.2f}"
+                  f"{t['max_daily_dd']:>9,.2f}"
+                  f"{t['max_eod_dd']:>9,.2f}"
+                  f"{t['eval_d1']:>12}"
+                  f"{pr:>8}")
     print("=" * 106)
+    if args.family in ("static_tp1", "tp_study", "all"):
+        neighbor_median_report(rows, None)
     print(f"\nelapsed {time.perf_counter() - started:.1f}s")
     print(f"written: {args.out / 'sweep_summary.csv'}")
     print(f"written: {args.out / 'daily_equity.csv'}")

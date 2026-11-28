@@ -23,9 +23,9 @@ class Settings(BaseSettings):
     topstep_enable_orders: bool = True
 
     # Strategy parameters (can also come from env)
-    stop_ticks: int = 240
+    stop_ticks: int = 240   # 60 points
     lots: int = 2
-    tp1_ticks: int = 80
+    tp1_ticks: int = 160    # 40 points
 
 
 settings = Settings()

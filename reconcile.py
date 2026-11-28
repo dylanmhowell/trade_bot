@@ -64,10 +64,14 @@ def run_patched(selected, sessions_dir):
         es, ee, fl = session_args(day)
         poc, vah, val = rth_profile_for_session(prices, sizes, stamps)
 
+        atr = np.zeros(len(prices), dtype=np.int32)
         trades, _summary = simulate(
             stamps, prices, poc, vah, val, day_ids,
             es, ee, fl, 0,
             120, 2, 80, False, True, 320, MIN_POC_DISTANCE_TICKS,
+            False, 0,
+            atr, 0.0, 60, 200, 0, 0, 1,
+            np.ones(len(prices), dtype=np.int8),
         )
         for t in trades:
             out.append({

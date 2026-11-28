@@ -46,10 +46,10 @@ TOPSTEP_ENABLE_ORDERS = settings.topstep_enable_orders
 
 EASTERN = ZoneInfo("America/New_York")
 
-# K_two_lot_60 parameters
-STOP_TICKS = 240          # 60 points
-LOTS = 2
-TP1_TICKS = 80            # 20 points
+# K_two_lot_60 parameters (TP1 = 40 points)
+STOP_TICKS = settings.stop_ticks          # 60 points
+LOTS = settings.lots
+TP1_TICKS = settings.tp1_ticks            # 40 points
 USE_POC_RUNG = False
 USE_OPP_RUNG = True
 RUNNER_TICKS = 0          # Runner goes to opposite VA edge
@@ -411,7 +411,7 @@ class KTwoLot60Engine:
         # Calculate targets and stops
         stop = price - direction * STOP_TICKS
 
-        # Leg 1: TP1 at 20 points
+        # Leg 1: TP1 at 40 points
         self.position.legs[0].open = True
         self.position.legs[0].target = price + direction * TP1_TICKS
         self.position.legs[0].stop = stop
